@@ -1,0 +1,20 @@
+version: 1
+checks:
+  passing_conclusions: [success, neutral, skipped]
+  ignore_checks: []
+  ignore_statuses: []
+  ignore_workflows: []
+reconciliation:
+  intervals_seconds: [30, 60, 120, 300]
+  max_duration_seconds: 21600
+  initial_grace_seconds: 10
+  quiet_period_seconds: 5
+empty_checks:
+  policy: pass_after_attempts
+  pass_after_attempts: 3
+bypass:
+  label: "skip warden"
+  allowed_permissions: [write, maintain, admin]
+comment:
+  enabled: true
+  min_update_interval_seconds: 5

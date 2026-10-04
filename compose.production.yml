@@ -1,0 +1,61 @@
+name: warden-production
+x-env: &env
+  DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL}
+  WARDEN_WEBHOOK_SECRET: ${WARDEN_WEBHOOK_SECRET:?Set WARDEN_WEBHOOK_SECRET}
+  WARDEN_APP_ID: ${WARDEN_APP_ID:?Set WARDEN_APP_ID}
+  WARDEN_PRIVATE_KEY_FILE: /run/secrets/warden_private_key
+  WARDEN_GITHUB_API_URL: ${WARDEN_GITHUB_API_URL:-https://api.github.com}
+  WARDEN_DEMO: "false"
+  WARDEN_JOB_LEASE_SECONDS: ${WARDEN_JOB_LEASE_SECONDS:-60}
+  WARDEN_WORKER_POLL_MS: ${WARDEN_WORKER_POLL_MS:-1000}
+services:
+  postgres:
+    image: postgres:17.9-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: warden
+      POSTGRES_PASSWORD: ${WARDEN_POSTGRES_PASSWORD:?Set WARDEN_POSTGRES_PASSWORD}
+      POSTGRES_DB: warden
+    volumes: [warden-data:/var/lib/postgresql/data]
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -h 127.0.0.1 -U warden -d warden]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+  migrate:
+    build: {context: ., target: api}
+    environment: *env
+    secrets: [warden_private_key]
+    command: [bun, dist/db/migrate.js]
+    depends_on:
+      postgres: {condition: service_healthy}
+  app:
+    build: {context: ., target: app}
+    restart: unless-stopped
+    environment: *env
+    secrets: [warden_private_key]
+    ports: ["127.0.0.1:${WARDEN_PORT:-3000}:3000"]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+    healthcheck:
+      test: [CMD, bun, -e, 'if (!(await fetch("http://localhost:3000/ready")).ok) process.exit(1)']
+      interval: 10s
+      timeout: 5s
+      retries: 3
+  api:
+    profiles: [split]
+    extends: {service: app}
+    build: {context: ., target: api}
+  worker:
+    profiles: [split]
+    build: {context: ., target: worker}
+    restart: unless-stopped
+    environment: *env
+    secrets: [warden_private_key]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+secrets:
+  warden_private_key:
+    file: ${WARDEN_PRIVATE_KEY_HOST_PATH:?Set WARDEN_PRIVATE_KEY_HOST_PATH}
+volumes:
+  warden-data:

@@ -1,0 +1,81 @@
+name: warden
+x-warden-env: &warden-env
+  DATABASE_URL: postgres://warden:warden@postgres:5432/warden
+  # Local tooling always uses the fixture, even in a production-configured shell.
+  WARDEN_WEBHOOK_SECRET: warden-local-webhook-secret
+  WARDEN_APP_ID: 1
+  WARDEN_PRIVATE_KEY_FILE: ""
+  WARDEN_PRIVATE_KEY: ""
+  WARDEN_GITHUB_API_URL: http://github:4000
+  WARDEN_DEMO: "true"
+  WARDEN_WORKER_POLL_MS: 100
+  WARDEN_JOB_LEASE_SECONDS: 10
+services:
+  postgres:
+    image: postgres:17.9-alpine
+    environment:
+      POSTGRES_USER: warden
+      POSTGRES_PASSWORD: warden
+      POSTGRES_DB: warden
+    volumes: ["${WARDEN_POSTGRES_DATA_DIR:-warden-data}:/var/lib/postgresql/data", ./scripts/postgres:/docker-entrypoint-initdb.d:ro]
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -h 127.0.0.1 -U warden -d warden]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+      start_period: 30s
+  migrate:
+    build: {context: ., target: development}
+    environment: *warden-env
+    command: [bun, run, migrate]
+    depends_on:
+      postgres: {condition: service_healthy}
+  github:
+    build: {context: ., target: development}
+    command: [bun, run, demo:github]
+    environment: {PORT: 4000}
+    healthcheck:
+      test: [CMD, bun, -e, 'if (!(await fetch("http://localhost:4000/health")).ok) process.exit(1)']
+      interval: 2s
+      timeout: 5s
+      retries: 60
+      start_period: 30s
+  api:
+    build: {context: ., target: api}
+    environment: *warden-env
+    ports: ["127.0.0.1:${WARDEN_PORT:-3000}:3000"]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      github: {condition: service_healthy}
+    healthcheck:
+      test: [CMD, bun, -e, 'if (!(await fetch("http://localhost:3000/health")).ok) process.exit(1)']
+      interval: 2s
+      timeout: 5s
+      retries: 60
+      start_period: 30s
+  worker:
+    build: {context: ., target: worker}
+    environment: *warden-env
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      github: {condition: service_healthy}
+  test:
+    profiles: [tools]
+    build: {context: ., target: development}
+    environment:
+      <<: *warden-env
+      WARDEN_TEST_DATABASE_URL: postgres://warden:warden@postgres:5432/warden_test
+    command: [bun, run, test:integration]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+  demo:
+    profiles: [tools]
+    build: {context: ., target: development}
+    environment:
+      <<: *warden-env
+      WARDEN_API_URL: http://api:3000
+    command: [bun, run, demo:assert]
+    depends_on:
+      api: {condition: service_healthy}
+volumes:
+  warden-data:
