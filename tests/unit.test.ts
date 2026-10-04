@@ -1,6 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import { redact } from "../src/api";
 import { defaultPolicy, parsePolicy } from "../src/config";
+import {
+  advanceDiscovery,
+  isEmptyEvaluation,
+  stabilityRemaining,
+} from "../src/discovery";
 import { evaluate } from "../src/evaluator";
 import { CHECK_NAME, type Check, type Snapshot } from "../src/model";
 
@@ -26,6 +31,128 @@ const snap = (checks: Check[] = []): Snapshot => ({
   statuses: [],
   suites: [],
   workflows: [],
+});
+
+describe("discovery progress", () => {
+  const now = new Date("2026-10-01T00:00:10Z");
+  const previous = {
+    fingerprint: null,
+    stableSince: null,
+    emptyScans: 2,
+    emptyNext: null,
+  };
+
+  test("empty policy follows the typed phase when presentation text changes", () => {
+    const evaluation = {
+      ...evaluate(snap(), defaultPolicy, 1),
+      reason: "Nothing to evaluate yet",
+    };
+    const progress = advanceDiscovery(
+      previous,
+      evaluation,
+      defaultPolicy,
+      now,
+      30,
+      true,
+    );
+    expect(progress.decision).toMatchObject({
+      state: "success",
+      phase: "passed",
+    });
+    expect(progress.emptyScans).toBe(3);
+
+    const waiting = snap();
+    waiting.suites.push({
+      id: 1,
+      appId: 2,
+      sha: "head",
+      status: "queued",
+      conclusion: null,
+    });
+    const pendingSuite = evaluate(waiting, defaultPolicy, 1);
+    expect(pendingSuite.applicable).toBe(0);
+    expect(isEmptyEvaluation(pendingSuite)).toBe(false);
+    expect(isEmptyEvaluation({ ...evaluation, state: "failure" })).toBe(false);
+  });
+
+  test("event overlays and early scheduled reads do not consume an empty scan", () => {
+    const evaluation = evaluate(snap(), defaultPolicy, 1);
+    const emptyNext = new Date(now.getTime() + 30000);
+    const progress = { ...previous, emptyNext };
+    for (const [at, authoritative] of [
+      [now, true],
+      [now, false],
+      [emptyNext, false],
+    ] as const) {
+      const result = advanceDiscovery(
+        progress,
+        evaluation,
+        defaultPolicy,
+        at,
+        30,
+        authoritative,
+      );
+      expect(result.emptyScans).toBe(2);
+      expect(result.decision.state).toBe("pending");
+    }
+    expect(
+      advanceDiscovery(progress, evaluation, defaultPolicy, emptyNext, 30, true)
+        .emptyScans,
+    ).toBe(3);
+  });
+
+  test("eligible work clears empty progress while unchanged evidence retains stability", () => {
+    const evaluation = evaluate(snap([run(1)]), defaultPolicy, 1);
+    const stableSince = new Date(now.getTime() - 5000);
+    const result = advanceDiscovery(
+      {
+        ...previous,
+        fingerprint: evaluation.fingerprint,
+        stableSince,
+        emptyNext: now,
+      },
+      evaluation,
+      defaultPolicy,
+      now,
+      30,
+      false,
+    );
+    expect(result.emptyScans).toBe(0);
+    expect(result.emptyNext).toBe(null);
+    expect(result.stableSince).toEqual(stableSince);
+    expect(
+      advanceDiscovery(previous, evaluation, defaultPolicy, now, 30, true)
+        .stableSince,
+    ).toEqual(now);
+  });
+
+  test("readiness waits for both discovery grace and the quiet period", () => {
+    const start = new Date(now.getTime() - 10000);
+    expect(
+      stabilityRemaining(
+        defaultPolicy,
+        start,
+        new Date(now.getTime() - 5000),
+        now,
+      ),
+    ).toBe(0);
+    expect(
+      stabilityRemaining(
+        defaultPolicy,
+        start,
+        new Date(now.getTime() - 3000),
+        now,
+      ),
+    ).toBe(2000);
+    expect(
+      stabilityRemaining(
+        defaultPolicy,
+        new Date(now.getTime() - 7000),
+        start,
+        now,
+      ),
+    ).toBe(3000);
+  });
 });
 describe("independent evaluator", () => {
   test("database JSON field order does not change check stability", () => {
