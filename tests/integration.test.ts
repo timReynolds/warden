@@ -37,6 +37,7 @@ import {
   COMMENT_MARKER,
   type Target,
 } from "../src/model";
+import { configFor } from "../src/policy-store";
 import { reconcile } from "../src/reconcile";
 import { storeSignal } from "../src/signals";
 import { workOnce } from "../src/worker";
@@ -159,6 +160,29 @@ afterAll(async () => {
   await api.stop();
   await http.stop();
   await close();
+});
+
+test("policy revisions and errors survive client restarts without refetching", async () => {
+  const pull = state.prs[0];
+  if (!pull) throw new Error("Missing PR base");
+  const revision = pull.base.sha;
+  const policy = await configFor(db, github, t, revision);
+  expect(github.requests).toBeGreaterThan(0);
+  state.config = "version: 99";
+  const restarted = new GitHub(env);
+  expect(await configFor(db, restarted, t, revision)).toEqual(policy);
+  expect(restarted.requests).toBe(0);
+
+  const invalidRevision = "d".repeat(40);
+  pull.base.sha = invalidRevision;
+  await expect(configFor(db, restarted, t, invalidRevision)).rejects.toThrow(
+    "Warden configuration:",
+  );
+  const retry = new GitHub(env);
+  await expect(configFor(db, retry, t, invalidRevision)).rejects.toThrow(
+    "Warden configuration:",
+  );
+  expect(retry.requests).toBe(0);
 });
 
 test("production App authentication signs valid JWTs and caches installation-scoped tokens", async () => {
