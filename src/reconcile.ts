@@ -24,6 +24,12 @@ import {
   targetKey,
 } from "./model";
 import { configFor } from "./policy-store";
+import {
+  publishComment,
+  publishGate,
+  recordDecision,
+  recordOutput,
+} from "./publication";
 import { applySignals } from "./signals";
 
 function dateOf(value: unknown): Date | null {
@@ -113,91 +119,6 @@ function ownedGateIds(snapshot: Snapshot, sha: string, appId: number) {
       )
       .map((check) => check.id),
   );
-}
-async function effect(
-  db: Database,
-  t: Target,
-  kind: string,
-  desired: unknown,
-  write: () => Promise<number>,
-): Promise<number> {
-  const row = (
-    await db.execute(
-      sql`INSERT INTO warden_effects(pr_key,kind,desired) VALUES(${targetKey(t)},${kind},${JSON.stringify(desired)}::jsonb) RETURNING id`,
-    )
-  )[0];
-  try {
-    const id = await write();
-    await db.execute(
-      sql`UPDATE warden_effects SET result=${JSON.stringify({ id })}::jsonb,completed_at=now() WHERE id=${row?.id}`,
-    );
-    return id;
-  } catch (error) {
-    await db.execute(
-      sql`UPDATE warden_effects SET error=${String(error).slice(0, 2000)},completed_at=now() WHERE id=${row?.id}`,
-    );
-    await db.execute(
-      sql`INSERT INTO warden_metrics(name,value) VALUES('publication_errors',1) ON CONFLICT(name) DO UPDATE SET value=warden_metrics.value+1`,
-    );
-    throw error;
-  }
-}
-const notFound = (error: unknown) =>
-  typeof error === "object" &&
-  error !== null &&
-  "status" in error &&
-  error.status === 404;
-async function publishGate(
-  db: Database,
-  tx: Pick<Database, "execute">,
-  github: GitHub,
-  t: Target,
-  sha: string,
-  decision: Decision,
-  hash: string,
-  observedGateIds: Set<number> | null = null,
-): Promise<number | null> {
-  await tx.execute(
-    sql`INSERT INTO warden_gates(installation_id,repository_id,sha) VALUES(${t.installationId},${t.repositoryId},${sha}) ON CONFLICT DO NOTHING`,
-  );
-  const gate = (
-    await tx.execute(
-      sql`SELECT * FROM warden_gates WHERE installation_id=${t.installationId} AND repository_id=${t.repositoryId} AND sha=${sha}`,
-    )
-  )[0];
-  let checkId = gate?.check_id ? Number(gate.check_id) : null;
-  if (
-    gate?.published_hash !== hash ||
-    (checkId !== null &&
-      observedGateIds !== null &&
-      !observedGateIds.has(checkId))
-  ) {
-    if (checkId === null) checkId = await github.findCheck(t, sha);
-    const write = () => github.publishCheck(t, sha, decision, checkId);
-    try {
-      checkId = await effect(
-        db,
-        t,
-        "check",
-        { sha: sha, decision, id: checkId },
-        write,
-      );
-    } catch (error) {
-      if (!notFound(error)) throw error;
-      checkId = await github.findCheck(t, sha);
-      checkId = await effect(
-        db,
-        t,
-        "check",
-        { sha: sha, decision, id: checkId },
-        write,
-      );
-    }
-    await tx.execute(
-      sql`UPDATE warden_gates SET check_id=${checkId},published_hash=${hash} WHERE installation_id=${t.installationId} AND repository_id=${t.repositoryId} AND sha=${sha}`,
-    );
-  }
-  return checkId;
 }
 async function peersFor(
   db: Pick<Database, "execute">,
@@ -746,17 +667,14 @@ async function reconcileLocked(
       };
     if (decision.state === "success" && !verified)
       throw new Error("Unverified success blocked");
-    await tx.execute(
-      sql`INSERT INTO warden_decisions(pr_key,sha,generation,decision) VALUES(${key},${p.sha},${Number(row.generation)},${JSON.stringify(decision)}::jsonb)`,
+    await recordDecision(tx, t, p.sha, Number(row.generation), decision);
+    const { hash, outputId } = await recordOutput(
+      db,
+      t,
+      p.sha,
+      Number(row.generation),
+      decision,
     );
-    const hash = createHash("sha256")
-      .update(JSON.stringify({ sha: p.sha, decision }))
-      .digest("hex");
-    const out = (
-      await db.execute(
-        sql`INSERT INTO warden_outputs(pr_key,sha,generation,hash,desired) VALUES(${key},${p.sha},${Number(row.generation)},${hash},${JSON.stringify(decision)}::jsonb) ON CONFLICT(pr_key,generation,hash) DO UPDATE SET desired=excluded.desired RETURNING id`,
-      )
-    )[0];
     const checkId = await publishGate(
       db,
       tx,
@@ -796,9 +714,14 @@ async function reconcileLocked(
         decision.state === "success" ||
         sinceComment >= policy.comment.min_update_interval_seconds * 1000)
     ) {
-      if (commentId === null) commentId = await github.findComment(t);
-      const write = () =>
-        github.publishComment(t, p.sha, decision, commentId, {
+      commentId = await publishComment(
+        db,
+        github,
+        t,
+        p.sha,
+        decision,
+        commentId,
+        {
           last: observationError
             ? "unavailable (observation failed)"
             : (lastRead?.toISOString() ?? "unavailable"),
@@ -808,32 +731,14 @@ async function reconcileLocked(
               : new Date(
                   now.getTime() + Math.max(delay, backoff) * 1000,
                 ).toISOString(),
-        });
-      try {
-        commentId = await effect(
-          db,
-          t,
-          "comment",
-          { sha: p.sha, decision, id: commentId },
-          write,
-        );
-      } catch (error) {
-        if (!notFound(error)) throw error;
-        commentId = await github.findComment(t);
-        commentId = await effect(
-          db,
-          t,
-          "comment",
-          { sha: p.sha, decision, id: commentId },
-          write,
-        );
-      }
+        },
+      );
       await tx.execute(
         sql`UPDATE warden_prs SET comment_id=${commentId},comment_hash=${hash},comment_updated_at=${now.toISOString()} WHERE key=${key}`,
       );
     }
     await db.execute(
-      sql`UPDATE warden_outputs SET published=true WHERE id=${out?.id}`,
+      sql`UPDATE warden_outputs SET published=true WHERE id=${outputId}`,
     );
     if (exhausted || (decision.state !== "pending" && !unsettled)) return null;
     return Math.max(delay, backoff);
@@ -896,16 +801,19 @@ export async function reconcile(
             fingerprint: "error",
           };
           const sha = String(current.sha);
-          const hash = createHash("sha256")
-            .update(JSON.stringify({ sha, decision }))
-            .digest("hex");
-          const out = (
-            await db.execute(
-              sql`INSERT INTO warden_outputs(pr_key,sha,generation,hash,desired) VALUES(${targetKey(t)},${sha},${Number(current.generation)},${hash},${JSON.stringify(decision)}::jsonb) ON CONFLICT(pr_key,generation,hash) DO UPDATE SET desired=excluded.desired RETURNING id`,
-            )
-          )[0];
-          await tx.execute(
-            sql`INSERT INTO warden_decisions(pr_key,sha,generation,decision) VALUES(${targetKey(t)},${sha},${Number(current.generation)},${JSON.stringify(decision)}::jsonb)`,
+          const { hash, outputId } = await recordOutput(
+            db,
+            t,
+            sha,
+            Number(current.generation),
+            decision,
+          );
+          await recordDecision(
+            tx,
+            t,
+            sha,
+            Number(current.generation),
+            decision,
           );
           await tx.execute(
             sql`UPDATE warden_prs SET last_decision=${JSON.stringify(decision)}::jsonb,published_hash=NULL,updated_at=clock_timestamp() WHERE key=${targetKey(t)}`,
@@ -936,7 +844,7 @@ export async function reconcile(
             sql`UPDATE warden_prs SET owner=${t.owner},repo=${t.repo},check_id=${checkId},last_decision=${JSON.stringify(decision)}::jsonb,published_hash=${hash},updated_at=clock_timestamp() WHERE key=${targetKey(t)}`,
           );
           await db.execute(
-            sql`UPDATE warden_outputs SET published=true WHERE id=${out?.id}`,
+            sql`UPDATE warden_outputs SET published=true WHERE id=${outputId}`,
           );
         }
       });
