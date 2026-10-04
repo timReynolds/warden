@@ -37,6 +37,7 @@ import {
   COMMENT_MARKER,
   type Target,
 } from "../src/model";
+import { configFor } from "../src/policy-store";
 import { reconcile } from "../src/reconcile";
 import { storeSignal } from "../src/signals";
 import { workOnce } from "../src/worker";
@@ -159,6 +160,29 @@ afterAll(async () => {
   await api.stop();
   await http.stop();
   await close();
+});
+
+test("policy revisions and errors survive client restarts without refetching", async () => {
+  const pull = state.prs[0];
+  if (!pull) throw new Error("Missing PR base");
+  const revision = pull.base.sha;
+  const policy = await configFor(db, github, t, revision);
+  expect(github.requests).toBeGreaterThan(0);
+  state.config = "version: 99";
+  const restarted = new GitHub(env);
+  expect(await configFor(db, restarted, t, revision)).toEqual(policy);
+  expect(restarted.requests).toBe(0);
+
+  const invalidRevision = "d".repeat(40);
+  pull.base.sha = invalidRevision;
+  await expect(configFor(db, restarted, t, invalidRevision)).rejects.toThrow(
+    "Warden configuration:",
+  );
+  const retry = new GitHub(env);
+  await expect(configFor(db, retry, t, invalidRevision)).rejects.toThrow(
+    "Warden configuration:",
+  );
+  expect(retry.requests).toBe(0);
 });
 
 test("production App authentication signs valid JWTs and caches installation-scoped tokens", async () => {
@@ -2295,6 +2319,38 @@ test("deleted settled outputs recover even when the desired decision is unchange
   expect(gate()?.conclusion).toBe("success");
   expect(state.comments).toHaveLength(1);
   expect(state.comments[0]?.body).toContain("Passed: 1");
+});
+
+test.each([
+  "check",
+  "comment",
+])("publication recovers a stale %s id and journals both attempts", async (kind) => {
+  state.checks = [fixtureCheck(1)];
+  await settle();
+  const id = kind === "check" ? gate()?.id : state.comments[0]?.id;
+  if (!id) throw new Error("Missing published output");
+  const before = (
+    await rows(sql`SELECT coalesce(max(id),0) AS id FROM warden_effects`)
+  )[0]?.id;
+  state.errorStatus = 404;
+  state.errorPath =
+    kind === "check" ? `/check-runs/${id}` : `/issues/comments/${id}`;
+  state.checks[0] = fixtureCheck(1, "failure");
+
+  await reconcile(db, github, t, clock);
+
+  expect(gate()?.conclusion).toBe("failure");
+  expect(state.comments[0]?.body).toContain("Checks failed");
+  expect(
+    state.checks.filter((check) => check.name === CHECK_NAME),
+  ).toHaveLength(1);
+  expect(state.comments).toHaveLength(1);
+  const attempts = await rows(
+    sql`SELECT error,result,completed_at FROM warden_effects WHERE kind=${kind} AND id>${before} ORDER BY id`,
+  );
+  expect(attempts).toHaveLength(2);
+  expect(attempts[0]?.error).toBeTruthy();
+  expect(attempts[1]).toMatchObject({ error: null, result: { id } });
 });
 
 test("authenticated rerequest invalidates the central gate cache and republishes", async () => {
