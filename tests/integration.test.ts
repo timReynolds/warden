@@ -37,6 +37,7 @@ import {
   COMMENT_MARKER,
   type Target,
 } from "../src/model";
+import { configFor } from "../src/policy-store";
 import { reconcile } from "../src/reconcile";
 import { storeSignal } from "../src/signals";
 import { workOnce } from "../src/worker";
@@ -159,6 +160,29 @@ afterAll(async () => {
   await api.stop();
   await http.stop();
   await close();
+});
+
+test("policy revisions and errors survive client restarts without refetching", async () => {
+  const pull = state.prs[0];
+  if (!pull) throw new Error("Missing PR base");
+  const revision = pull.base.sha;
+  const policy = await configFor(db, github, t, revision);
+  expect(github.requests).toBeGreaterThan(0);
+  state.config = "version: 99";
+  const restarted = new GitHub(env);
+  expect(await configFor(db, restarted, t, revision)).toEqual(policy);
+  expect(restarted.requests).toBe(0);
+
+  const invalidRevision = "d".repeat(40);
+  pull.base.sha = invalidRevision;
+  await expect(configFor(db, restarted, t, invalidRevision)).rejects.toThrow(
+    "Warden configuration:",
+  );
+  const retry = new GitHub(env);
+  await expect(configFor(db, retry, t, invalidRevision)).rejects.toThrow(
+    "Warden configuration:",
+  );
+  expect(retry.requests).toBe(0);
 });
 
 test("production App authentication signs valid JWTs and caches installation-scoped tokens", async () => {
@@ -1766,42 +1790,47 @@ test("an ambiguous publication failure resets consecutive empty scans after roll
   ).toMatchObject({ empty_scans: 0, fingerprint: null });
 });
 
-test.each([
-  "installation",
-  "repository",
-])("%s suspension during an outstanding PR read cannot be undone by reconciliation", async (scope) => {
-  state.checks = [fixtureCheck(1)];
-  await webhook();
-  await workOnce(db, github);
-  await settle();
-  await rows(sql`TRUNCATE warden_jobs`);
-  state.pullDelayMs = 300;
-  const pending = reconcile(db, github, t, clock);
-  const until = Date.now() + 5000;
-  while (state.pullDelayMs > 0 && Date.now() < until) await Bun.sleep(10);
-  expect(state.pullDelayMs).toBe(0);
-  await changeLifecycle(
-    db,
-    1,
-    scope === "installation" ? null : 10,
-    "suspended",
-  );
-  expect(await pending).toBeNull();
-  expect(
-    (await rows(sql`SELECT state,fingerprint FROM warden_prs`))[0],
-  ).toMatchObject({ state: "suspended", fingerprint: null });
-  await changeLifecycle(db, 1, scope === "installation" ? null : 10, "active");
-  expect(
-    (await rows(sql`SELECT state,fingerprint FROM warden_prs`))[0],
-  ).toMatchObject({ state: "open", fingerprint: null });
-  expect(
-    (
-      await rows(
-        sql`SELECT payload FROM warden_jobs WHERE key='reconcile:1/10#1'`,
-      )
-    )[0]?.payload,
-  ).toMatchObject({ wardenRenew: true });
-});
+test.each(["installation", "repository"])(
+  "%s suspension during an outstanding PR read cannot be undone by reconciliation",
+  async (scope) => {
+    state.checks = [fixtureCheck(1)];
+    await webhook();
+    await workOnce(db, github);
+    await settle();
+    await rows(sql`TRUNCATE warden_jobs`);
+    state.pullDelayMs = 300;
+    const pending = reconcile(db, github, t, clock);
+    const until = Date.now() + 5000;
+    while (state.pullDelayMs > 0 && Date.now() < until) await Bun.sleep(10);
+    expect(state.pullDelayMs).toBe(0);
+    await changeLifecycle(
+      db,
+      1,
+      scope === "installation" ? null : 10,
+      "suspended",
+    );
+    expect(await pending).toBeNull();
+    expect(
+      (await rows(sql`SELECT state,fingerprint FROM warden_prs`))[0],
+    ).toMatchObject({ state: "suspended", fingerprint: null });
+    await changeLifecycle(
+      db,
+      1,
+      scope === "installation" ? null : 10,
+      "active",
+    );
+    expect(
+      (await rows(sql`SELECT state,fingerprint FROM warden_prs`))[0],
+    ).toMatchObject({ state: "open", fingerprint: null });
+    expect(
+      (
+        await rows(
+          sql`SELECT payload FROM warden_jobs WHERE key='reconcile:1/10#1'`,
+        )
+      )[0]?.payload,
+    ).toMatchObject({ wardenRenew: true });
+  },
+);
 
 test("bulk reactivation waits for head publication and atomically queues unready peers", async () => {
   state.checks = [fixtureCheck(1)];
@@ -1936,93 +1965,93 @@ test("PR lifecycle membership waits for the shared SHA publication lock", async 
   ).toBe(1);
 });
 
-test.each([
-  "onboarding",
-  "check activity",
-])("%s readiness renewal waits for shared SHA publication", async (source) => {
-  state.checks = [fixtureCheck(1)];
-  const pr = state.prs[0];
-  if (!pr) throw new Error("Missing PR");
-  state.prs.push({ ...pr, number: 2 });
-  await reconcile(db, github, t, clock);
-  await reconcile(db, github, { ...t, number: 2 }, clock);
-  advance();
-  await reconcile(db, github, t, clock);
-  await rows(sql`TRUNCATE warden_jobs`);
-  await rows(
-    sql`UPDATE warden_prs SET window_start=now()-interval '10 seconds'`,
-  );
-  // Visit the peer first during onboarding, while the head lock represents the
-  // other PR's publication after it has already read this peer's readiness.
-  if (source === "onboarding") state.prs.reverse();
-  const number = source === "onboarding" ? 2 : 1;
-  const original = (
+test.each(["onboarding", "check activity"])(
+  "%s readiness renewal waits for shared SHA publication",
+  async (source) => {
+    state.checks = [fixtureCheck(1)];
+    const pr = state.prs[0];
+    if (!pr) throw new Error("Missing PR");
+    state.prs.push({ ...pr, number: 2 });
+    await reconcile(db, github, t, clock);
+    await reconcile(db, github, { ...t, number: 2 }, clock);
+    advance();
+    await reconcile(db, github, t, clock);
+    await rows(sql`TRUNCATE warden_jobs`);
     await rows(
-      sql`SELECT window_start,fingerprint FROM warden_prs WHERE number=${number}`,
-    )
-  )[0];
-  let release: () => void = () => {};
-  let ready: () => void = () => {};
-  const released = new Promise<void>((resolve) => {
-    release = resolve;
-  });
-  const acquired = new Promise<void>((resolve) => {
-    ready = resolve;
-  });
-  const holder = db.transaction(async (tx) => {
-    await tx.execute(
-      sql`SELECT pg_advisory_xact_lock(hashtextextended(${`1/10:${pr.head.sha}`},1))`,
+      sql`UPDATE warden_prs SET window_start=now()-interval '10 seconds'`,
     );
-    ready();
-    await released;
-  });
-  await acquired;
-  let renewal: Promise<unknown> | undefined;
-  try {
-    if (source === "onboarding") renewal = onboardRepository(db, github, t);
-    else {
-      await webhook("check_run", {
-        action: "completed",
-        check_run: fixtureCheck(1),
-        pull_request: undefined,
-      });
-      const job = await claim(db, 10);
-      if (!job) throw new Error("Missing delivery job");
-      renewal = processDelivery(db, github, job);
-    }
-    const until = Date.now() + 5000;
-    let waiting = false;
-    while (Date.now() < until) {
-      waiting =
+    // Visit the peer first during onboarding, while the head lock represents the
+    // other PR's publication after it has already read this peer's readiness.
+    if (source === "onboarding") state.prs.reverse();
+    const number = source === "onboarding" ? 2 : 1;
+    const original = (
+      await rows(
+        sql`SELECT window_start,fingerprint FROM warden_prs WHERE number=${number}`,
+      )
+    )[0];
+    let release: () => void = () => {};
+    let ready: () => void = () => {};
+    const released = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const acquired = new Promise<void>((resolve) => {
+      ready = resolve;
+    });
+    const holder = db.transaction(async (tx) => {
+      await tx.execute(
+        sql`SELECT pg_advisory_xact_lock(hashtextextended(${`1/10:${pr.head.sha}`},1))`,
+      );
+      ready();
+      await released;
+    });
+    await acquired;
+    let renewal: Promise<unknown> | undefined;
+    try {
+      if (source === "onboarding") renewal = onboardRepository(db, github, t);
+      else {
+        await webhook("check_run", {
+          action: "completed",
+          check_run: fixtureCheck(1),
+          pull_request: undefined,
+        });
+        const job = await claim(db, 10);
+        if (!job) throw new Error("Missing delivery job");
+        renewal = processDelivery(db, github, job);
+      }
+      const until = Date.now() + 5000;
+      let waiting = false;
+      while (Date.now() < until) {
+        waiting =
+          (
+            await rows(
+              sql`SELECT 1 FROM pg_locks WHERE locktype='advisory' AND NOT granted`,
+            )
+          ).length > 0;
+        if (waiting) break;
+        await Bun.sleep(10);
+      }
+      expect(waiting).toBe(true);
+      expect(
         (
           await rows(
-            sql`SELECT 1 FROM pg_locks WHERE locktype='advisory' AND NOT granted`,
+            sql`SELECT window_start,fingerprint FROM warden_prs WHERE number=${number}`,
           )
-        ).length > 0;
-      if (waiting) break;
-      await Bun.sleep(10);
+        )[0],
+      ).toEqual(original);
+    } finally {
+      release();
+      await holder;
+      await renewal;
     }
-    expect(waiting).toBe(true);
     expect(
       (
         await rows(
-          sql`SELECT window_start,fingerprint FROM warden_prs WHERE number=${number}`,
+          sql`SELECT window_start FROM warden_prs WHERE number=${number}`,
         )
-      )[0],
-    ).toEqual(original);
-  } finally {
-    release();
-    await holder;
-    await renewal;
-  }
-  expect(
-    (
-      await rows(
-        sql`SELECT window_start FROM warden_prs WHERE number=${number}`,
-      )
-    )[0]?.window_start,
-  ).not.toEqual(original?.window_start);
-});
+      )[0]?.window_start,
+    ).not.toEqual(original?.window_start);
+  },
+);
 
 test("a retried lifecycle delivery retains former-head recovery after its PR transaction committed", async () => {
   const { pr, peer } = await sharedMergeFailure();
@@ -2297,6 +2326,38 @@ test("deleted settled outputs recover even when the desired decision is unchange
   expect(state.comments[0]?.body).toContain("Passed: 1");
 });
 
+test.each(["check", "comment"])(
+  "publication recovers a stale %s id and journals both attempts",
+  async (kind) => {
+    state.checks = [fixtureCheck(1)];
+    await settle();
+    const id = kind === "check" ? gate()?.id : state.comments[0]?.id;
+    if (!id) throw new Error("Missing published output");
+    const before = (
+      await rows(sql`SELECT coalesce(max(id),0) AS id FROM warden_effects`)
+    )[0]?.id;
+    state.errorStatus = 404;
+    state.errorPath =
+      kind === "check" ? `/check-runs/${id}` : `/issues/comments/${id}`;
+    state.checks[0] = fixtureCheck(1, "failure");
+
+    await reconcile(db, github, t, clock);
+
+    expect(gate()?.conclusion).toBe("failure");
+    expect(state.comments[0]?.body).toContain("Checks failed");
+    expect(
+      state.checks.filter((check) => check.name === CHECK_NAME),
+    ).toHaveLength(1);
+    expect(state.comments).toHaveLength(1);
+    const attempts = await rows(
+      sql`SELECT error,result,completed_at FROM warden_effects WHERE kind=${kind} AND id>${before} ORDER BY id`,
+    );
+    expect(attempts).toHaveLength(2);
+    expect(attempts[0]?.error).toBeTruthy();
+    expect(attempts[1]).toMatchObject({ error: null, result: { id } });
+  },
+);
+
 test("authenticated rerequest invalidates the central gate cache and republishes", async () => {
   state.checks = [fixtureCheck(1)];
   await settle();
@@ -2400,8 +2461,7 @@ test("timestamp-less same-ID queue receipts require fresh stability and are retr
     pull_request: undefined,
   });
   const delivery = await claim(db, 10);
-  if (!delivery || delivery.kind !== "delivery")
-    throw new Error("Missing queued delivery");
+  if (delivery?.kind !== "delivery") throw new Error("Missing queued delivery");
   await processDelivery(db, github, delivery);
   await processDelivery(db, github, delivery);
   expect(
