@@ -24,9 +24,12 @@ plan.
 1. Stop every application process that can write to the database. Keep the
    currently selected production volume unchanged while taking the backup.
    The temporary override starts the existing cluster with PostgreSQL 17 and its
-   original mount location:
+   original mount location. Use a new backup filename; the commands below refuse
+   to overwrite an existing backup and stop on errors:
 
    ```sh
+   (
+   set -eu
    docker compose -f compose.production.yml --profile split stop app api worker
    cat > /tmp/warden-postgres17.yml <<'YAML'
    services:
@@ -35,10 +38,11 @@ plan.
        volumes: !override [warden-data:/var/lib/postgresql/data]
    YAML
    docker compose -f compose.production.yml -f /tmp/warden-postgres17.yml up -d --wait postgres
-   (umask 077; docker compose -f compose.production.yml -f /tmp/warden-postgres17.yml exec -T postgres pg_dump -U warden -d warden -Fc > warden-pg17.dump)
+   (umask 077; set -C; docker compose -f compose.production.yml -f /tmp/warden-postgres17.yml exec -T postgres pg_dump -U warden -d warden -Fc > warden-pg17.dump)
    test -s warden-pg17.dump
    docker compose -f compose.production.yml -f /tmp/warden-postgres17.yml exec -T postgres pg_restore --list < warden-pg17.dump > /dev/null
    docker compose -f compose.production.yml -f /tmp/warden-postgres17.yml stop postgres
+   )
    ```
 
    Proceed only if the dump and archive-list commands both succeed. Record the
@@ -52,11 +56,17 @@ plan.
 
    ```sh
    export WARDEN_POSTGRES_VOLUME=warden-production-pg18
-   # This command must report that the volume does not exist.
-   docker volume inspect "$WARDEN_POSTGRES_VOLUME"
+   (
+   set -eu
+   docker info > /dev/null
+   if docker volume inspect "$WARDEN_POSTGRES_VOLUME" > /dev/null 2>&1; then
+     printf '%s\n' 'Choose an unused replacement volume before restoring.' >&2
+     exit 1
+   fi
    docker compose -f compose.production.yml up -d --wait postgres
    docker compose -f compose.production.yml exec -T postgres pg_restore -U warden -d warden --exit-on-error < warden-pg17.dump
    docker compose -f compose.production.yml exec -T postgres psql -U warden -d warden -v ON_ERROR_STOP=1 -c 'SELECT version();' -c '\dt' -c 'SELECT count(*) FROM warden_deliveries;'
+   )
    ```
 
    Stop on any restore error. Check the schema and history against the source
