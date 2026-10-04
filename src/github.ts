@@ -79,7 +79,6 @@ export class GitHub {
     client: Octokit;
   }>();
   public readonly webhooks: Webhooks<{ octokit: Octokit }>;
-  private configCache = new Map<string, string | null>();
   public requests = 0;
   public readonly appId: number;
   constructor(
@@ -385,9 +384,6 @@ export class GitHub {
   }
   async config(t: Target, baseSha: string): Promise<string | null> {
     const client = await this.client(t.installationId);
-    const key = `${t.installationId}/${t.repositoryId}:${baseSha}`;
-    if (this.configCache.has(key)) return this.configCache.get(key) ?? null;
-    if (this.configCache.size > 1000) this.configCache.clear();
     try {
       const content = z.string().parse(
         (
@@ -400,7 +396,6 @@ export class GitHub {
           })
         ).data,
       );
-      this.configCache.set(key, content);
       return content;
     } catch (error) {
       if (error instanceof RequestError && error.status === 404) {
@@ -455,7 +450,6 @@ export class GitHub {
               "Warden configuration exists or absence cannot be verified; contents read failed",
             );
         }
-        this.configCache.set(key, null);
         return null;
       }
       throw error;

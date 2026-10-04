@@ -25,7 +25,7 @@ import {
   type Target,
   targetKey,
 } from "./model";
-import { configFor } from "./reconcile";
+import { configFor } from "./policy-store";
 import { storeSignal } from "./signals";
 
 const repository = z.object({
