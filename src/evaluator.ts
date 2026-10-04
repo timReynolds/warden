@@ -9,6 +9,13 @@ import {
   type Snapshot,
   type Workflow,
 } from "./model";
+export type Evaluation = Omit<Decision, "state" | "phase"> &
+  (
+    | { state: "failure"; phase: "failed" }
+    | { state: "pending"; phase: "running" | "discovery" }
+    | { state: "success"; phase: "passed" }
+  );
+
 export function matches(name: string, patterns: string[]): boolean {
   return patterns.some((pattern) =>
     new RegExp(
@@ -32,7 +39,7 @@ export function evaluate(
   snapshot: Snapshot,
   policy: Policy,
   appId: number,
-): Decision {
+): Evaluation {
   const workflows = new Map<number, Workflow>();
   const currentWorkflows = new Map<string, Workflow>();
   for (const w of snapshot.workflows) {

@@ -10,6 +10,14 @@ import {
   lockLifecycle,
 } from "./db/prs";
 import { enqueue } from "./db/queue";
+import {
+  advanceDiscovery,
+  dateOf,
+  isEmptyEvaluation,
+  pending,
+  settledSuccess,
+  stabilityRemaining,
+} from "./discovery";
 import { evaluate } from "./evaluator";
 import type { GitHub } from "./github";
 import { lifecycleActive } from "./installations";
@@ -32,25 +40,6 @@ import {
 } from "./publication";
 import { applySignals } from "./signals";
 
-function dateOf(value: unknown): Date | null {
-  const date =
-    value instanceof Date
-      ? value
-      : typeof value === "string"
-        ? new Date(value)
-        : null;
-  return date && Number.isFinite(date.getTime()) ? date : null;
-}
-function settledSuccess(value: unknown): boolean {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    "state" in value &&
-    value.state === "success" &&
-    "phase" in value &&
-    value.phase === "passed"
-  );
-}
 async function deliveryBlocked(
   db: Pick<Database, "execute">,
   value: unknown,
@@ -72,9 +61,6 @@ export const controls: Controls = {
   now: () => new Date(),
   jitter: () => Math.random(),
 };
-function pending(d: Decision, reason: string, blockers: string[]): Decision {
-  return { ...d, state: "pending", phase: "discovery", reason, blockers };
-}
 async function snapshotFor(
   github: GitHub,
   t: Target,
@@ -289,73 +275,47 @@ async function reconcileLocked(
             sql`INSERT INTO warden_attempts(pr_key,sha,kind,identity,outcome,data) VALUES(${key},${item.sha},${kind},${String(item.id)},${outcome},${JSON.stringify(item)}::jsonb)`,
           );
         }
-      decision = evaluate(snapshot, policy, github.appId);
-      fingerprint = decision.fingerprint;
+      const evaluation = evaluate(snapshot, policy, github.appId);
+      fingerprint = evaluation.fingerprint;
       if (previouslySettled && row.fingerprint !== fingerprint) {
         windowStart = now;
         await tx.execute(
           sql`UPDATE warden_prs SET window_start=${now.toISOString()} WHERE key=${key}`,
         );
       }
-      const stableSince =
-        row.fingerprint === fingerprint && dateOf(row.stable_since)
-          ? (dateOf(row.stable_since) ?? now)
-          : now;
-      const isEmpty =
-        decision.applicable === 0 && decision.reason === "No applicable checks";
-      if (!isEmpty) emptyScans = 0;
-      else if (
-        !tracked &&
-        (!dateOf(row.empty_next_at) ||
-          now.getTime() >= (dateOf(row.empty_next_at)?.getTime() ?? 0))
-      )
-        emptyScans++;
-      const emptyNext = isEmpty
-        ? tracked
-          ? dateOf(row.empty_next_at)
-          : new Date(now.getTime() + delay * 1000)
-        : null;
+      const discovery = advanceDiscovery(
+        {
+          fingerprint:
+            typeof row.fingerprint === "string" ? row.fingerprint : null,
+          stableSince: dateOf(row.stable_since),
+          emptyScans,
+          emptyNext: dateOf(row.empty_next_at),
+        },
+        evaluation,
+        policy,
+        now,
+        delay,
+        !tracked,
+      );
+      const { stableSince, emptyNext } = discovery;
+      emptyScans = discovery.emptyScans;
+      decision = discovery.decision;
       await tx.execute(
         sql`UPDATE warden_prs SET fingerprint=${fingerprint},stable_since=${stableSince.toISOString()},empty_scans=${emptyScans},empty_next_at=${emptyNext?.toISOString() ?? null},scan_attempt=scan_attempt+${tracked ? 0 : 1} WHERE key=${key}`,
       );
-      if (
-        isEmpty &&
-        policy.empty_checks.policy === "pass_after_attempts" &&
-        emptyScans >= policy.empty_checks.pass_after_attempts
-      )
-        decision = {
-          ...decision,
-          state: "success",
-          phase: "passed",
-          reason: `No eligible checks: passed after ${emptyScans} complete scheduled empty scans`,
-          blockers: [],
-        };
-      else if (isEmpty)
-        decision = pending(decision, "Discovering checks", [
-          policy.empty_checks.policy === "block"
-            ? "Empty-check policy blocks success"
-            : `${emptyScans}/${policy.empty_checks.pass_after_attempts} complete scheduled empty scans`,
-        ]);
       const elapsed = now.getTime() - windowStart.getTime();
       if (decision.state === "success") {
-        const quiet = policy.reconciliation.quiet_period_seconds * 1000;
-        const grace = policy.reconciliation.initial_grace_seconds * 1000;
-        if (elapsed < grace || now.getTime() - stableSince.getTime() < quiet) {
+        const remaining = stabilityRemaining(
+          policy,
+          windowStart,
+          stableSince,
+          now,
+        );
+        if (remaining > 0) {
           decision = pending(decision, "Verifying stable check results", [
             "Initial discovery grace and quiet period must complete",
           ]);
-          delay = Math.min(
-            delay,
-            Math.max(
-              1,
-              Math.ceil(
-                Math.max(
-                  grace - elapsed,
-                  quiet - (now.getTime() - stableSince.getTime()),
-                ) / 1000,
-              ),
-            ),
-          );
+          delay = Math.min(delay, Math.max(1, Math.ceil(remaining / 1000)));
         } else {
           const finalSnapshot = await applySignals(
             tx,
@@ -472,7 +432,11 @@ async function reconcileLocked(
             }),
             peerPolicy,
           );
-          let peerDecision = evaluate(peerSnapshot, peerPolicy, github.appId);
+          let peerDecision: Decision = evaluate(
+            peerSnapshot,
+            peerPolicy,
+            github.appId,
+          );
           const peerCurrent = await github.pull(pt);
           const peerNow = c.now();
           const peerRow = (
@@ -518,11 +482,9 @@ async function reconcileLocked(
             peerLabelsMatch &&
             peerStable &&
             peerStart &&
-            peerNow.getTime() - peerStart.getTime() >=
-              peerPolicy.reconciliation.initial_grace_seconds * 1000 &&
             (!peerExpired || peerSettled) &&
-            peerNow.getTime() - peerStable.getTime() >=
-              peerPolicy.reconciliation.quiet_period_seconds * 1000;
+            stabilityRemaining(peerPolicy, peerStart, peerStable, peerNow) ===
+              0;
           if (
             (!peerRow ||
               peerRow.fingerprint !== peerDecision.fingerprint ||
@@ -534,7 +496,7 @@ async function reconcileLocked(
           )
             await enqueue(tx, pt);
           if (
-            peerDecision.reason === "No applicable checks" &&
+            isEmptyEvaluation(peerDecision) &&
             peerPolicy.empty_checks.policy === "pass_after_attempts" &&
             Number(peerRow?.empty_scans ?? 0) >=
               peerPolicy.empty_checks.pass_after_attempts
