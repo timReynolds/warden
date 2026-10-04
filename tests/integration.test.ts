@@ -2321,6 +2321,38 @@ test("deleted settled outputs recover even when the desired decision is unchange
   expect(state.comments[0]?.body).toContain("Passed: 1");
 });
 
+test.each([
+  "check",
+  "comment",
+])("publication recovers a stale %s id and journals both attempts", async (kind) => {
+  state.checks = [fixtureCheck(1)];
+  await settle();
+  const id = kind === "check" ? gate()?.id : state.comments[0]?.id;
+  if (!id) throw new Error("Missing published output");
+  const before = (
+    await rows(sql`SELECT coalesce(max(id),0) AS id FROM warden_effects`)
+  )[0]?.id;
+  state.errorStatus = 404;
+  state.errorPath =
+    kind === "check" ? `/check-runs/${id}` : `/issues/comments/${id}`;
+  state.checks[0] = fixtureCheck(1, "failure");
+
+  await reconcile(db, github, t, clock);
+
+  expect(gate()?.conclusion).toBe("failure");
+  expect(state.comments[0]?.body).toContain("Checks failed");
+  expect(
+    state.checks.filter((check) => check.name === CHECK_NAME),
+  ).toHaveLength(1);
+  expect(state.comments).toHaveLength(1);
+  const attempts = await rows(
+    sql`SELECT error,result,completed_at FROM warden_effects WHERE kind=${kind} AND id>${before} ORDER BY id`,
+  );
+  expect(attempts).toHaveLength(2);
+  expect(attempts[0]?.error).toBeTruthy();
+  expect(attempts[1]).toMatchObject({ error: null, result: { id } });
+});
+
 test("authenticated rerequest invalidates the central gate cache and republishes", async () => {
   state.checks = [fixtureCheck(1)];
   await settle();
