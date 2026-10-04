@@ -1,5 +1,5 @@
-import { createHash } from "node:crypto";
 import { sql } from "drizzle-orm";
+import { applyBypass } from "./bypass";
 import { parsePolicy } from "./config";
 import type { Database } from "./db";
 import {
@@ -13,7 +13,6 @@ import { enqueue } from "./db/queue";
 import {
   advanceDiscovery,
   dateOf,
-  isEmptyEvaluation,
   pending,
   settledSuccess,
   stabilityRemaining,
@@ -23,14 +22,16 @@ import type { GitHub } from "./github";
 import { lifecycleActive } from "./installations";
 import {
   BYPASS_LABEL,
-  CHECK_NAME,
   type Decision,
-  type PullRequest,
-  type Snapshot,
   sameSubject,
   type Target,
   targetKey,
 } from "./model";
+import {
+  readObservation,
+  recordObservation,
+  verifyObservation,
+} from "./observations";
 import { configFor } from "./policy-store";
 import {
   publishComment,
@@ -38,91 +39,13 @@ import {
   recordDecision,
   recordOutput,
 } from "./publication";
-import { applySignals } from "./signals";
+import { deliveryBlocked, evaluateSharedHead } from "./shared-head";
 
-async function deliveryBlocked(
-  db: Pick<Database, "execute">,
-  value: unknown,
-): Promise<boolean> {
-  if (!Array.isArray(value) || !value.length) return false;
-  const ids = value.map(String);
-  const row = (
-    await db.execute(
-      sql`SELECT count(*) AS count,bool_and(completed) AS done FROM warden_jobs WHERE id IN (${sql.join(
-        ids.map((id) => sql`${id}::uuid`),
-        sql`,`,
-      )})`,
-    )
-  )[0];
-  return Number(row?.count) !== ids.length || row?.done !== true;
-}
 export type Controls = { now: () => Date; jitter: () => number };
 export const controls: Controls = {
   now: () => new Date(),
   jitter: () => Math.random(),
 };
-async function snapshotFor(
-  github: GitHub,
-  t: Target,
-  p: PullRequest,
-  cachedHead?: Snapshot,
-): Promise<Snapshot> {
-  const head = cachedHead ?? (await github.snapshot(t, p.sha));
-  if (!p.mergeSha || p.mergeSha === p.sha) return head;
-  const merge = await github.snapshot(t, p.mergeSha);
-  return {
-    checks: head.checks.concat(merge.checks),
-    statuses: head.statuses.concat(merge.statuses),
-    suites: head.suites.concat(merge.suites),
-    workflows: head.workflows.concat(merge.workflows),
-  };
-}
-async function trackedSnapshot(
-  db: Pick<Database, "execute">,
-  t: Target,
-  p: PullRequest,
-  generation: number,
-): Promise<{ snapshot: Snapshot; at: Date } | null> {
-  const row = (
-    await db.execute(sql`SELECT snapshot,observed_at FROM warden_observations
-    WHERE pr_key=${targetKey(t)} AND sha=${p.sha} AND generation=${generation}
-    AND base_sha=${p.baseSha} AND merge_sha IS NOT DISTINCT FROM ${p.mergeSha}
-    AND source IN ('github','final-verification') ORDER BY id DESC LIMIT 1`)
-  )[0];
-  const at = dateOf(row?.observed_at);
-  // Only Warden's fully-read snapshots are stored under these sources. Event
-  // observations never become a discovery baseline, including after a restart.
-  return row && at ? { snapshot: row.snapshot as Snapshot, at } : null;
-}
-function ownedGateIds(snapshot: Snapshot, sha: string, appId: number) {
-  return new Set(
-    snapshot.checks
-      .filter(
-        (check) =>
-          check.sha === sha &&
-          check.appId === appId &&
-          check.name === CHECK_NAME,
-      )
-      .map((check) => check.id),
-  );
-}
-async function peersFor(
-  db: Pick<Database, "execute">,
-  github: GitHub,
-  t: Target,
-  sha: string,
-) {
-  const known = await db.execute(
-    sql`SELECT number FROM warden_prs WHERE installation_id=${t.installationId} AND repository_id=${t.repositoryId} AND sha=${sha} AND state='open'`,
-  );
-  return [
-    ...new Set(
-      known
-        .map((row) => Number(row.number))
-        .concat(await github.associated(t, sha)),
-    ),
-  ];
-}
 async function reconcileLocked(
   db: Database,
   github: GitHub,
@@ -224,57 +147,29 @@ async function reconcileLocked(
           sql`UPDATE warden_prs SET delivery_error_jobs='{}' WHERE key=${key}`,
         );
       }
-      const baseline = events
-        ? await trackedSnapshot(tx, t, p, Number(row.generation))
-        : null;
-      let tracked = baseline !== null;
-      let snapshot = await applySignals(
+      const observation = await readObservation(
+        tx,
+        github,
+        t,
+        p,
+        policy,
+        Number(row.generation),
+        events,
+        () => c.now(),
+      );
+      const { snapshot, tracked } = observation;
+      now = observation.at;
+      lastRead = observation.lastRead;
+      observedGateIds = observation.observedGateIds;
+      let peerHead = snapshot;
+      await recordObservation(
         tx,
         t,
-        baseline?.snapshot ?? (await snapshotFor(github, t, p)),
-        policy,
-        tracked,
+        p,
+        Number(row.generation),
+        tracked ? "events" : "github",
+        snapshot,
       );
-      // New jobs can require workflow/job metadata which a check webhook lacks.
-      // Resolve that metadata rather than guessing an ignored workflow.
-      if (
-        tracked &&
-        policy.checks.ignore_workflows.length &&
-        snapshot.checks.some(
-          (check) =>
-            check.appId !== github.appId &&
-            !baseline?.snapshot.checks.some(
-              (old) => old.id === check.id && old.sha === check.sha,
-            ),
-        )
-      ) {
-        tracked = false;
-        snapshot = await applySignals(
-          tx,
-          t,
-          await snapshotFor(github, t, p),
-          policy,
-        );
-      }
-      now = c.now();
-      lastRead = tracked ? (baseline?.at ?? null) : now;
-      let peerHead = snapshot;
-      observedGateIds = tracked
-        ? null
-        : ownedGateIds(snapshot, p.sha, github.appId);
-      await tx.execute(
-        sql`INSERT INTO warden_observations(pr_key,sha,generation,base_sha,merge_sha,source,snapshot) VALUES(${key},${p.sha},${Number(row.generation)},${p.baseSha},${p.mergeSha},${tracked ? "events" : "github"},${JSON.stringify(snapshot)}::jsonb)`,
-      );
-      for (const [kind, items] of Object.entries(snapshot))
-        for (const item of items) {
-          const outcome =
-            "state" in item
-              ? String(item.state)
-              : String(item.conclusion ?? item.status);
-          await tx.execute(
-            sql`INSERT INTO warden_attempts(pr_key,sha,kind,identity,outcome,data) VALUES(${key},${item.sha},${kind},${String(item.id)},${outcome},${JSON.stringify(item)}::jsonb)`,
-          );
-        }
       const evaluation = evaluate(snapshot, policy, github.appId);
       fingerprint = evaluation.fingerprint;
       if (previouslySettled && row.fingerprint !== fingerprint) {
@@ -317,18 +212,25 @@ async function reconcileLocked(
           ]);
           delay = Math.min(delay, Math.max(1, Math.ceil(remaining / 1000)));
         } else {
-          const finalSnapshot = await applySignals(
+          const finalRead = await verifyObservation(
+            tx,
+            github,
+            t,
+            p,
+            policy,
+            () => c.now(),
+          );
+          peerHead = finalRead.snapshot;
+          observedGateIds = finalRead.observedGateIds;
+          const final = finalRead.evaluation;
+          lastRead = finalRead.at;
+          await recordObservation(
             tx,
             t,
-            await snapshotFor(github, t, p),
-            policy,
-          );
-          peerHead = finalSnapshot;
-          observedGateIds = ownedGateIds(finalSnapshot, p.sha, github.appId);
-          const final = evaluate(finalSnapshot, policy, github.appId);
-          lastRead = c.now();
-          await tx.execute(
-            sql`INSERT INTO warden_observations(pr_key,sha,generation,base_sha,merge_sha,source,snapshot) VALUES(${key},${p.sha},${Number(row.generation)},${p.baseSha},${p.mergeSha},'final-verification',${JSON.stringify(finalSnapshot)}::jsonb)`,
+            p,
+            Number(row.generation),
+            "final-verification",
+            finalRead.snapshot,
           );
           if (final.fingerprint !== fingerprint) {
             decision =
@@ -352,203 +254,26 @@ async function reconcileLocked(
           } else verified = true;
         }
       }
-      if (!p.labels.includes(BYPASS_LABEL))
-        await tx.execute(
-          sql`UPDATE warden_prs SET bypass_actor=NULL,bypass_sha=NULL,bypass_application_id=NULL WHERE key=${key}`,
-        );
-      if (
-        p.labels.includes(BYPASS_LABEL) &&
-        typeof row.bypass_actor === "string" &&
-        row.bypass_sha === p.sha
-      ) {
-        const application = await github.labelApplication(t, BYPASS_LABEL);
-        const permission = await github.permission(t, row.bypass_actor);
-        if (
-          application &&
-          application.id === row.bypass_application_id &&
-          application.actor === row.bypass_actor &&
-          policy.bypass.allowed_permissions.some(
-            (value) => value === permission,
-          )
-        ) {
-          const peers = await peersFor(tx, github, t, p.sha);
-          if (peers.length === 1 && peers[0] === t.number) {
-            decision = {
-              ...decision,
-              state: "success",
-              phase: "bypassed",
-              reason: `Bypassed via skip warden by ${row.bypass_actor}`,
-              blockers: [],
-            };
-            verified = true;
-          } else {
-            // A label cannot weaken a peer's gate. Normal verified evaluation
-            // remains available when every subject passes without bypass.
-            decision = {
-              ...decision,
-              reason: `${decision.reason}; bypass unavailable on a shared head`,
-              blockers:
-                decision.state === "success"
-                  ? []
-                  : [
-                      ...decision.blockers,
-                      "A shared head cannot be bypassed independently",
-                    ],
-            };
-          }
-        }
-      } else if (p.labels.includes(BYPASS_LABEL))
-        decision = {
-          ...decision,
-          blockers: [
-            ...decision.blockers,
-            "skip warden has no verified grant for this PR/head; normal evaluation applies",
-          ],
-        };
+      decision = await applyBypass(tx, github, t, p, row, policy, decision);
+      if (decision.phase === "bypassed") verified = true;
       if (
         decision.phase !== "bypassed" &&
         (elapsed < policy.reconciliation.max_duration_seconds * 1000 ||
           (previouslySettled && row.fingerprint === fingerprint))
       ) {
-        for (const number of (await peersFor(tx, github, t, p.sha)).filter(
-          (n) => n !== t.number,
-        )) {
-          let pt = { ...t, number };
-          const peer = await github.pull(pt);
-          pt = { ...pt, owner: peer.owner, repo: peer.repo };
-          if (peer.sha !== p.sha || peer.state !== "open") continue;
-          const peerPolicy = await configFor(db, github, pt, peer.baseSha);
-          // Also include a peer's distinct current merge candidate, if any.
-          const peerSnapshot = await applySignals(
-            tx,
-            pt,
-            await snapshotFor(github, pt, peer, {
-              checks: peerHead.checks.filter((item) => item.sha === p.sha),
-              statuses: peerHead.statuses.filter((item) => item.sha === p.sha),
-              suites: peerHead.suites.filter((item) => item.sha === p.sha),
-              workflows: peerHead.workflows.filter(
-                (item) => item.sha === p.sha,
-              ),
-            }),
-            peerPolicy,
-          );
-          let peerDecision: Decision = evaluate(
-            peerSnapshot,
-            peerPolicy,
-            github.appId,
-          );
-          const peerCurrent = await github.pull(pt);
-          const peerNow = c.now();
-          const peerRow = (
-            await tx.execute(
-              sql`SELECT * FROM warden_prs WHERE key=${targetKey(pt)} AND owner=${peer.owner} AND repo=${peer.repo} AND sha=${peer.sha} AND base_sha=${peer.baseSha} AND base_ref=${peer.baseRef} AND state='open' AND merge_sha IS NOT DISTINCT FROM ${peer.mergeSha}`,
-            )
-          )[0];
-          const peerStable = dateOf(peerRow?.stable_since);
-          const peerStart = dateOf(peerRow?.window_start);
-          const peerExpired =
-            peerStart &&
-            peerNow.getTime() - peerStart.getTime() >=
-              peerPolicy.reconciliation.max_duration_seconds * 1000;
-          const peerSettled =
-            settledSuccess(peerRow?.last_decision) &&
-            peerRow?.fingerprint === peerDecision.fingerprint;
-          if (
-            peerStart &&
-            !peerSettled &&
-            peerRow?.fingerprint === peerDecision.fingerprint
-          )
-            peerDeadlines.push({
-              number,
-              at:
-                peerStart.getTime() +
-                peerPolicy.reconciliation.max_duration_seconds * 1000,
-            });
-          if (await deliveryBlocked(tx, peerRow?.delivery_error_jobs)) {
-            peerDecision = {
-              ...peerDecision,
-              state: "failure",
-              reason: "Failed webhook delivery has not recovered",
-            };
-          }
-          const peerLabelsMatch =
-            peerRow?.labels_hash ===
-            createHash("sha256")
-              .update(JSON.stringify([...peer.labels].sort()))
-              .digest("hex");
-          const peerReady =
-            peerRow &&
-            peerRow.fingerprint === peerDecision.fingerprint &&
-            peerLabelsMatch &&
-            peerStable &&
-            peerStart &&
-            (!peerExpired || peerSettled) &&
-            stabilityRemaining(peerPolicy, peerStart, peerStable, peerNow) ===
-              0;
-          if (
-            (!peerRow ||
-              peerRow.fingerprint !== peerDecision.fingerprint ||
-              !peerStable ||
-              !peerLabelsMatch) &&
-            (!peerExpired ||
-              (settledSuccess(peerRow?.last_decision) &&
-                peerRow?.fingerprint !== peerDecision.fingerprint))
-          )
-            await enqueue(tx, pt);
-          if (
-            isEmptyEvaluation(peerDecision) &&
-            peerPolicy.empty_checks.policy === "pass_after_attempts" &&
-            Number(peerRow?.empty_scans ?? 0) >=
-              peerPolicy.empty_checks.pass_after_attempts
-          )
-            peerDecision = { ...peerDecision, state: "success" };
-          if (!sameSubject(peerCurrent, peer))
-            peerDecision = {
-              ...peerDecision,
-              state: "pending",
-              reason: "Peer subject changed",
-            };
-          if (peerDecision.state !== "success" || !peerReady) {
-            const reason =
-              peerDecision.state === "success" && !peerReady
-                ? "Discovery/stability has not completed for this PR"
-                : peerDecision.reason;
-            const blockers = [
-              ...decision.blockers,
-              `PR #${number}: ${reason}`,
-              ...peerDecision.blockers.map(
-                (blocker) => `PR #${number}: ${blocker}`,
-              ),
-            ];
-            const details = [
-              ...(decision.details ?? []),
-              ...(peerDecision.details ?? []).map((detail) => ({
-                ...detail,
-                name: `PR #${number}: ${detail.name}`,
-              })),
-            ];
-            if (peerDecision.state === "failure")
-              decision = {
-                ...decision,
-                state: "failure",
-                phase: "failed",
-                reason: "Shared head has another PR with blockers",
-                blockers,
-                details,
-              };
-            else if (decision.state === "success")
-              decision = {
-                ...pending(
-                  decision,
-                  "Shared head has another PR with blockers",
-                  blockers,
-                ),
-                details,
-              };
-            else decision = { ...decision, blockers, details };
-            verified = false;
-          }
-        }
+        const shared = await evaluateSharedHead(
+          db,
+          tx,
+          github,
+          t,
+          p,
+          decision,
+          peerHead,
+          () => c.now(),
+          peerDeadlines,
+        );
+        decision = shared.decision;
+        if (shared.blocked) verified = false;
       }
     } catch (error) {
       observationError = true;
