@@ -17,7 +17,7 @@ jobs:
     timeout-minutes: 25
     services:
       postgres:
-        image: postgres:17.9-alpine
+        image: postgres:18.6-alpine
         env:
           POSTGRES_USER: warden
           POSTGRES_PASSWORD: warden
@@ -39,6 +39,7 @@ jobs:
       - run: bun run audit
       - run: bun run notices:check
       - run: bun run check
+      - run: sh scripts/test-postgres-upgrade.sh
       - run: docker compose build
       - run: docker build --target app -t warden-app .
       - run: bun run demo

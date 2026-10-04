@@ -10,13 +10,14 @@ x-env: &env
   WARDEN_WORKER_POLL_MS: ${WARDEN_WORKER_POLL_MS:-1000}
 services:
   postgres:
+    # PostgreSQL 17 data requires migration; see docs/postgresql-upgrade.md.
     image: postgres:18.6-alpine
     restart: unless-stopped
     environment:
       POSTGRES_USER: warden
       POSTGRES_PASSWORD: ${WARDEN_POSTGRES_PASSWORD:?Set WARDEN_POSTGRES_PASSWORD}
       POSTGRES_DB: warden
-    volumes: [warden-data:/var/lib/postgresql/data]
+    volumes: [warden-data:/var/lib/postgresql]
     healthcheck:
       test: [CMD-SHELL, pg_isready -h 127.0.0.1 -U warden -d warden]
       interval: 5s
@@ -59,3 +60,4 @@ secrets:
     file: ${WARDEN_PRIVATE_KEY_HOST_PATH:?Set WARDEN_PRIVATE_KEY_HOST_PATH}
 volumes:
   warden-data:
+    name: ${WARDEN_POSTGRES_VOLUME:-${COMPOSE_PROJECT_NAME}_warden-data}
