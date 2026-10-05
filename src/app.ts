@@ -1,24 +1,25 @@
 import { createApi } from "./api";
 import { connect } from "./db";
 import { type Env, readEnv } from "./env";
-import { createGitHub, runWorker } from "./worker";
+import { createGitHubApp, runWorker } from "./worker";
 
 export async function start(mode: "app" | "api" | "worker", supplied?: Env) {
   const env = supplied ?? (await readEnv());
   const { db, close } = connect(env.DATABASE_URL);
   const controller = new AbortController();
-  const github = createGitHub(db, env);
+  const githubApp = createGitHubApp(db, env);
   const server = Bun.serve({
     port:
       mode === "worker"
         ? Number(process.env.WARDEN_WORKER_HEALTH_PORT ?? 3001)
         : env.PORT,
-    fetch: createApi(db, mode === "worker" ? undefined : github.webhooks).fetch,
+    fetch: createApi(db, mode === "worker" ? undefined : githubApp.webhooks)
+      .fetch,
   });
   const worker =
     mode === "api"
       ? Promise.resolve()
-      : runWorker(db, github, env, controller.signal);
+      : runWorker(db, githubApp, env, controller.signal);
   let shutdown: Promise<void> | undefined;
   const stop = () =>
     (shutdown ??= (async () => {

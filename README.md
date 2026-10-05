@@ -55,8 +55,9 @@ docker compose up -d --build
 curl --fail http://127.0.0.1:3000/ready
 ```
 
-This local Compose configuration always uses fixture authentication. Follow the
-[deployment guide](docs/deployment.md) to connect Warden to GitHub.
+The fixture generates a local test key, and Warden uses its normal GitHub App
+authentication against the fixture. Follow the [deployment guide](docs/deployment.md)
+to connect Warden to GitHub.
 
 ## Install on GitHub
 

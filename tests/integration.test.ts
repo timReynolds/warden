@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Webhooks } from "@octokit/webhooks";
 import { sql } from "drizzle-orm";
+import type { App } from "octokit";
 import {
   createFixture,
   type FixtureState,
@@ -25,7 +26,7 @@ import { migrate } from "../src/db/migrate";
 import { claim, enqueue, fail, finish } from "../src/db/queue";
 import type { Env } from "../src/env";
 import { processDelivery, recoverFailedDelivery } from "../src/events";
-import { GitHub, GitHubError } from "../src/github";
+import { createApp, GitHub, GitHubError } from "../src/github";
 import {
   changeLifecycle,
   onboardInstallation,
@@ -62,6 +63,7 @@ let state: FixtureState;
 const fixture = createFixture();
 const http = Bun.serve({ port: 0, fetch: fixture.app.fetch });
 const api = Bun.serve({ port: 0, fetch: createApi(db, webhooks).fetch });
+let app: App;
 let github: GitHub;
 let time: Date;
 const clock = { now: () => time, jitter: () => 0.5 };
@@ -74,10 +76,9 @@ const env: Env = {
   PORT: 3000,
   WARDEN_APP_ID: 1,
   WARDEN_GITHUB_API_URL: http.url.toString().replace(/\/$/, ""),
-  WARDEN_DEMO: "true",
   WARDEN_JOB_LEASE_SECONDS: 10,
   WARDEN_WORKER_POLL_MS: 100,
-  privateKey: undefined,
+  privateKey: fixture.privateKey,
 };
 const gate = () => state.checks.filter((c) => c.name === CHECK_NAME).at(-1);
 async function rows(query: ReturnType<typeof sql>) {
@@ -132,7 +133,7 @@ async function settle() {
 async function drainDelivery(response: Response) {
   const delivery = String((await response.json()).delivery);
   for (let i = 0; i < 10; i++) {
-    await workOnce(db, github);
+    await workOnce(db, app, env.WARDEN_APP_ID);
     const job = (
       await rows(
         sql`SELECT completed FROM warden_jobs WHERE key=${`delivery:${delivery}`}`,
@@ -153,7 +154,8 @@ beforeEach(async () => {
   state = initialState();
   Object.assign(fixture.getState(), state);
   state = fixture.getState();
-  github = new GitHub(env);
+  app = createApp(env);
+  github = new GitHub(await app.getInstallationOctokit(1), env.WARDEN_APP_ID);
   time = new Date();
 });
 afterAll(async () => {
@@ -162,36 +164,70 @@ afterAll(async () => {
   await close();
 });
 
+test("application configuration requires a GitHub App private key", async () => {
+  const child = Bun.spawn(
+    [
+      process.execPath,
+      "-e",
+      'import { readEnv } from "./src/env"; await readEnv();',
+    ],
+    {
+      env: {
+        DATABASE_URL: databaseUrl,
+        WARDEN_APP_ID: "1",
+        WARDEN_WEBHOOK_SECRET: secret,
+        WARDEN_PRIVATE_KEY: "",
+        WARDEN_PRIVATE_KEY_FILE: "",
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    },
+  );
+  expect(await child.exited).not.toBe(0);
+  expect(await new Response(child.stderr).text()).toContain(
+    "Set WARDEN_PRIVATE_KEY_FILE or WARDEN_PRIVATE_KEY",
+  );
+});
+
 test("policy revisions and errors survive client restarts without refetching", async () => {
   const pull = state.prs[0];
   if (!pull) throw new Error("Missing PR base");
   const revision = pull.base.sha;
   const policy = await configFor(db, github, t, revision);
-  expect(github.requests).toBeGreaterThan(0);
+  expect(state.requests.length).toBeGreaterThan(0);
+  const requests = state.requests.length;
   state.config = "version: 99";
-  const restarted = new GitHub(env);
+  const restarted = new GitHub(
+    await createApp(env).getInstallationOctokit(1),
+    env.WARDEN_APP_ID,
+  );
   expect(await configFor(db, restarted, t, revision)).toEqual(policy);
-  expect(restarted.requests).toBe(0);
+  expect(state.requests).toHaveLength(requests);
 
   const invalidRevision = "d".repeat(40);
   pull.base.sha = invalidRevision;
   await expect(configFor(db, restarted, t, invalidRevision)).rejects.toThrow(
     "Warden configuration:",
   );
-  const retry = new GitHub(env);
+  const invalidRequests = state.requests.length;
+  const retry = new GitHub(
+    await createApp(env).getInstallationOctokit(1),
+    env.WARDEN_APP_ID,
+  );
   await expect(configFor(db, retry, t, invalidRevision)).rejects.toThrow(
     "Warden configuration:",
   );
-  expect(retry.requests).toBe(0);
+  expect(state.requests).toHaveLength(invalidRequests);
 });
 
-test("production App authentication signs valid JWTs and caches installation-scoped tokens", async () => {
+test("production App authentication caches tokens and isolates concurrent installation clients and deliveries", async () => {
   const keys = generateKeyPairSync("rsa", { modulusLength: 2048 });
   const privateKey = keys.privateKey
     .export({ type: "pkcs8", format: "pem" })
     .toString();
   const minted: number[] = [];
   const used: string[] = [];
+  const deliveries: string[] = [];
   const service = Bun.serve({
     port: 0,
     fetch: async (request) => {
@@ -247,6 +283,11 @@ test("production App authentication signs valid JWTs and caches installation-sco
             `^(token|Bearer) ghs_warden_fixture_${scopedInstallation}$`,
           ),
         );
+      const delivery = request.headers.get("x-github-delivery");
+      if (delivery) {
+        expect(delivery).toBe(`installation-${scopedInstallation}`);
+        deliveries.push(delivery);
+      }
       return Response.json(
         path === "/repos/acme/repo"
           ? { id: 10, name: "repo", owner: { login: "acme" }, archived: false }
@@ -255,37 +296,71 @@ test("production App authentication signs valid JWTs and caches installation-sco
     },
   });
   try {
-    const production = new GitHub({
+    const app = createApp({
       ...env,
-      WARDEN_DEMO: "false",
       WARDEN_GITHUB_API_URL: service.url.toString().replace(/\/$/, ""),
       privateKey,
     });
+    const production = new GitHub(
+      await app.getInstallationOctokit(1),
+      env.WARDEN_APP_ID,
+    );
     expect(await production.installationState(1)).toBe("active");
     expect((await production.pull(t)).sha).toBe("a".repeat(40));
     await production.pull(t);
-    await production.pull({ ...t, installationId: 2 });
+    const second = new GitHub(
+      await app.getInstallationOctokit(2),
+      env.WARDEN_APP_ID,
+    );
+    await second.pull({ ...t, installationId: 2 });
     expect(minted).toEqual([1, 2]);
     expect(used).toHaveLength(3);
     expect(used[0]).toBe(used[1]);
     expect(used[2]).not.toBe(used[0]);
     expect((await production.repository(t)).state).toBe("active");
     await Promise.all(
-      [1, 2].map((installationId) =>
-        production.withClient(installationId, async () => {
-          const target = {
-            ...t,
-            installationId,
-            repo: `install-${installationId}`,
-          };
-          await production.pull(target);
-          await Bun.sleep(5);
-          await production.pull(target);
-        }),
-      ),
+      [1, 2].map(async (installationId) => {
+        const github = new GitHub(
+          await app.getInstallationOctokit(installationId),
+          env.WARDEN_APP_ID,
+        );
+        const target = {
+          ...t,
+          installationId,
+          repo: `install-${installationId}`,
+        };
+        await github.pull(target);
+        await Bun.sleep(5);
+        await github.pull(target);
+      }),
     );
     expect(minted).toEqual([1, 2]);
     expect(used).toHaveLength(8);
+    for (const installationId of [1, 2]) {
+      const response = await webhook(
+        "pull_request",
+        {
+          installation: { id: installationId },
+          repository: {
+            id: 10,
+            name: `install-${installationId}`,
+            owner: { login: "acme" },
+          },
+        },
+        `installation-${installationId}`,
+      );
+      expect(response.status).toBe(202);
+    }
+    const jobs = [await claim(db, 60), await claim(db, 60)];
+    await Promise.all(
+      jobs.map((job) => {
+        if (job?.kind !== "delivery") throw new Error("Missing delivery");
+        return processDelivery(db, app, env.WARDEN_APP_ID, job);
+      }),
+    );
+    expect(deliveries.sort()).toEqual(["installation-1", "installation-2"]);
+    expect(minted).toEqual([1, 2]);
+    expect(used).toHaveLength(10);
   } finally {
     await service.stop();
   }
@@ -297,6 +372,8 @@ test("Octokit follows Link headers across short pages without duplicating query 
     port: 0,
     fetch: (request) => {
       const url = new URL(request.url);
+      if (url.pathname.endsWith("/access_tokens"))
+        return fixture.app.fetch(request);
       expect(url.pathname).toBe("/repos/acme/repo/pulls");
       expect(url.searchParams.getAll("page")).toHaveLength(1);
       expect(url.searchParams.getAll("per_page")).toEqual(["100"]);
@@ -312,13 +389,16 @@ test("Octokit follows Link headers across short pages without duplicating query 
     },
   });
   try {
-    const client = new GitHub({
+    const app = createApp({
       ...env,
       WARDEN_GITHUB_API_URL: service.url.toString().replace(/\/$/, ""),
     });
+    const client = new GitHub(
+      await app.getInstallationOctokit(1),
+      env.WARDEN_APP_ID,
+    );
     expect(await client.openPulls(t)).toEqual([{ number: 1 }, { number: 2 }]);
     expect(pages).toEqual(["1", "7"]);
-    expect(client.requests).toBe(2);
   } finally {
     await service.stop();
   }
@@ -340,17 +420,27 @@ for (const { name, response } of [
   { name: "null body", response: null },
 ]) {
   test(`pagination rejects ${name} before completing a snapshot`, async () => {
+    let requests = 0;
     const service = Bun.serve({
       port: 0,
-      fetch: () => Response.json(response),
+      fetch: (request) => {
+        if (new URL(request.url).pathname.endsWith("/access_tokens"))
+          return fixture.app.fetch(request);
+        requests++;
+        return Response.json(response);
+      },
     });
     try {
-      const client = new GitHub({
+      const app = createApp({
         ...env,
         WARDEN_GITHUB_API_URL: service.url.toString().replace(/\/$/, ""),
       });
+      const client = new GitHub(
+        await app.getInstallationOctokit(1),
+        env.WARDEN_APP_ID,
+      );
       await expect(client.snapshot(t, "a".repeat(40))).rejects.toThrow();
-      expect(client.requests).toBe(1);
+      expect(requests).toBe(1);
     } finally {
       await service.stop();
     }
@@ -362,6 +452,8 @@ test("pagination stops at Warden's request bound even with an endless next link"
   const service = Bun.serve({
     port: 0,
     fetch: (request) => {
+      if (new URL(request.url).pathname.endsWith("/access_tokens"))
+        return fixture.app.fetch(request);
       requests++;
       return Response.json([], {
         headers: { link: `<${request.url}>; rel="next"` },
@@ -369,10 +461,14 @@ test("pagination stops at Warden's request bound even with an endless next link"
     },
   });
   try {
-    const client = new GitHub({
+    const app = createApp({
       ...env,
       WARDEN_GITHUB_API_URL: service.url.toString().replace(/\/$/, ""),
     });
+    const client = new GitHub(
+      await app.getInstallationOctokit(1),
+      env.WARDEN_APP_ID,
+    );
     await expect(client.openPulls(t)).rejects.toThrow("safety bound");
     expect(requests).toBe(50);
   } finally {
@@ -412,7 +508,7 @@ for (const status of [403, 429]) {
       if (!(error instanceof GitHubError)) throw error;
       expect(error.retryAfter).toBe(120);
     }
-    expect(github.requests).toBe(1);
+    expect(state.requests).toHaveLength(1);
   });
 }
 
@@ -422,12 +518,12 @@ describe("real PostgreSQL and real GitHub HTTP client acceptance", () => {
     const response = await webhook();
     expect(response.status).toBe(202);
     expect((await rows(sql`SELECT * FROM warden_deliveries`)).length).toBe(1);
-    expect(await workOnce(db, github)).toBe(true);
-    expect(await workOnce(db, github)).toBe(true);
+    expect(await workOnce(db, app, env.WARDEN_APP_ID)).toBe(true);
+    expect(await workOnce(db, app, env.WARDEN_APP_ID)).toBe(true);
     expect(gate()?.status).toBe("in_progress");
     expect(state.comments[0]?.body.startsWith(COMMENT_MARKER)).toBe(true);
     await Bun.sleep(1100);
-    await workOnce(db, github);
+    await workOnce(db, app, env.WARDEN_APP_ID);
     expect(gate()?.conclusion).toBe("success");
     expect(
       (await rows(sql`SELECT * FROM warden_decisions`)).length,
@@ -802,16 +898,16 @@ describe("real PostgreSQL and real GitHub HTTP client acceptance", () => {
       label: { name: "skip warden" },
       sender: { login: "mallory" },
     });
-    await workOnce(db, github);
-    await workOnce(db, github);
+    await workOnce(db, app, env.WARDEN_APP_ID);
+    await workOnce(db, app, env.WARDEN_APP_ID);
     expect(gate()?.conclusion).toBe("failure");
     await webhook("pull_request", {
       action: "labeled",
       label: { name: "skip warden" },
       sender: { login: "alice" },
     });
-    await workOnce(db, github);
-    await workOnce(db, github);
+    await workOnce(db, app, env.WARDEN_APP_ID);
+    await workOnce(db, app, env.WARDEN_APP_ID);
     expect(gate()?.conclusion).toBe("success");
     expect(state.comments[0]?.body).toContain("Bypassed via skip warden");
     if (p) p.labels = [];
@@ -819,8 +915,8 @@ describe("real PostgreSQL and real GitHub HTTP client acceptance", () => {
       action: "unlabeled",
       label: { name: "skip warden" },
     });
-    await workOnce(db, github);
-    await workOnce(db, github);
+    await workOnce(db, app, env.WARDEN_APP_ID);
+    await workOnce(db, app, env.WARDEN_APP_ID);
     expect(gate()?.conclusion).toBe("failure");
     expect(state.comments).toHaveLength(1);
   });
@@ -834,8 +930,8 @@ describe("real PostgreSQL and real GitHub HTTP client acceptance", () => {
       action: "labeled",
       label: { name: "skip warden" },
     });
-    await workOnce(db, github);
-    await workOnce(db, github);
+    await workOnce(db, app, env.WARDEN_APP_ID);
+    await workOnce(db, app, env.WARDEN_APP_ID);
     expect(gate()?.conclusion).not.toBe("success");
   });
   test("trusted config is pinned, malformed config blocks even bypass", async () => {
@@ -876,7 +972,7 @@ describe("real PostgreSQL and real GitHub HTTP client acceptance", () => {
       check_run: current,
       pull_request: undefined,
     });
-    await workOnce(db, github);
+    await workOnce(db, app, env.WARDEN_APP_ID);
     expect(
       await rows(sql`SELECT * FROM warden_jobs WHERE kind='reconcile'`),
     ).toHaveLength(0);
@@ -886,7 +982,7 @@ describe("real PostgreSQL and real GitHub HTTP client acceptance", () => {
       requested_action: { identifier: ACTION_ID },
       pull_request: undefined,
     });
-    await workOnce(db, github);
+    await workOnce(db, app, env.WARDEN_APP_ID);
     expect(
       await rows(sql`SELECT * FROM warden_audit WHERE kind='manual_reconcile'`),
     ).toHaveLength(1);
@@ -902,8 +998,8 @@ describe("real PostgreSQL and real GitHub HTTP client acceptance", () => {
       action: "labeled",
       label: { name: "skip warden" },
     });
-    await workOnce(db, github);
-    await workOnce(db, github);
+    await workOnce(db, app, env.WARDEN_APP_ID);
+    await workOnce(db, app, env.WARDEN_APP_ID);
     expect(gate()?.conclusion).toBe("failure");
     expect(
       (await rows(sql`SELECT bypass_actor FROM warden_prs`))[0]?.bypass_actor,
@@ -919,8 +1015,8 @@ describe("real PostgreSQL and real GitHub HTTP client acceptance", () => {
       check_run: fixtureCheck(1, "failure"),
       pull_request: undefined,
     });
-    await workOnce(db, github, 60, clock);
-    await workOnce(db, github, 60, clock);
+    await workOnce(db, app, env.WARDEN_APP_ID, 60, clock);
+    await workOnce(db, app, env.WARDEN_APP_ID, 60, clock);
     expect(gate()?.conclusion).toBe("success");
     await webhook("check_run", {
       action: "rerequested",
@@ -928,7 +1024,7 @@ describe("real PostgreSQL and real GitHub HTTP client acceptance", () => {
       pull_request: undefined,
       sender: { login: "mallory" },
     });
-    await workOnce(db, github, 60, clock);
+    await workOnce(db, app, env.WARDEN_APP_ID, 60, clock);
     expect(
       await rows(sql`SELECT * FROM warden_audit WHERE kind='manual_reconcile'`),
     ).toHaveLength(0);
@@ -937,7 +1033,7 @@ describe("real PostgreSQL and real GitHub HTTP client acceptance", () => {
       check_run: current,
       pull_request: undefined,
     });
-    await workOnce(db, github, 60, clock);
+    await workOnce(db, app, env.WARDEN_APP_ID, 60, clock);
     expect(
       await rows(sql`SELECT * FROM warden_audit WHERE kind='manual_reconcile'`),
     ).toHaveLength(1);
@@ -980,7 +1076,8 @@ describe("real PostgreSQL and real GitHub HTTP client acceptance", () => {
     state.loseNextWrite = true;
     await expect(reconcile(db, github, t, clock)).rejects.toThrow();
     expect(state.checks.filter((c) => c.name === CHECK_NAME)).toHaveLength(1);
-    github = new GitHub(env);
+    app = createApp(env);
+    github = new GitHub(await app.getInstallationOctokit(1), env.WARDEN_APP_ID);
     await reconcile(db, github, t, clock);
     expect(state.checks.filter((c) => c.name === CHECK_NAME)).toHaveLength(1);
     expect(state.comments).toHaveLength(1);
@@ -1030,8 +1127,8 @@ describe("real PostgreSQL and real GitHub HTTP client acceptance", () => {
       check_run: unseen,
       pull_request: undefined,
     });
-    await workOnce(db, github);
-    await workOnce(db, github);
+    await workOnce(db, app, env.WARDEN_APP_ID);
+    await workOnce(db, app, env.WARDEN_APP_ID);
     expect(gate()?.status).toBe("in_progress");
     advance();
     await reconcile(db, github, t, clock);
@@ -1048,8 +1145,8 @@ describe("real PostgreSQL and real GitHub HTTP client acceptance", () => {
       check_run: fixtureCheck(4, "failure"),
       pull_request: undefined,
     });
-    await workOnce(db, github);
-    await workOnce(db, github);
+    await workOnce(db, app, env.WARDEN_APP_ID);
+    await workOnce(db, app, env.WARDEN_APP_ID);
     expect(gate()?.conclusion).toBe("failure");
   });
   test("initial grace and timeout are blocking", async () => {
@@ -1081,14 +1178,14 @@ describe("real PostgreSQL and real GitHub HTTP client acceptance", () => {
   test("onboarding discovers existing PRs and fork webhook empty arrays use durable SHA associations", async () => {
     expect(await onboardInstallation(db, github, 1)).toBe(1);
     state.checks = [fixtureCheck(1)];
-    await workOnce(db, github);
+    await workOnce(db, app, env.WARDEN_APP_ID);
     await webhook("check_run", {
       action: "completed",
       check_run: state.checks[0],
       pull_request: undefined,
       pull_requests: [],
     });
-    await workOnce(db, github);
+    await workOnce(db, app, env.WARDEN_APP_ID);
     expect(
       await rows(
         sql`SELECT * FROM warden_jobs WHERE kind='reconcile' AND NOT completed`,
@@ -1109,7 +1206,7 @@ describe("real PostgreSQL and real GitHub HTTP client acceptance", () => {
       repository: undefined,
       pull_request: undefined,
     });
-    await workOnce(db, github);
+    await workOnce(db, app, env.WARDEN_APP_ID);
     const requests = state.requests.length;
     expect(await reconcile(db, github, t, clock)).toBe(null);
     expect(state.requests.length).toBe(requests);
@@ -1119,7 +1216,7 @@ describe("real PostgreSQL and real GitHub HTTP client acceptance", () => {
       repository: undefined,
       pull_request: undefined,
     });
-    await workOnce(db, github);
+    await workOnce(db, app, env.WARDEN_APP_ID);
     expect((await rows(sql`SELECT state FROM warden_prs`))[0]?.state).toBe(
       "open",
     );
@@ -1127,16 +1224,17 @@ describe("real PostgreSQL and real GitHub HTTP client acceptance", () => {
   test("accepted delivery survives worker restart and missed completion is scheduled", async () => {
     state.checks = [fixtureCheck(1, null, "in_progress")];
     await webhook();
-    await workOnce(db, github);
-    await workOnce(db, github);
+    await workOnce(db, app, env.WARDEN_APP_ID);
+    await workOnce(db, app, env.WARDEN_APP_ID);
     expect(gate()?.status).toBe("in_progress");
     const run = state.checks.find((c) => c.id === 1);
     if (run) Object.assign(run, fixtureCheck(1));
-    github = new GitHub(env);
+    app = createApp(env);
+    github = new GitHub(await app.getInstallationOctokit(1), env.WARDEN_APP_ID);
     await Bun.sleep(1100);
-    await workOnce(db, github);
+    await workOnce(db, app, env.WARDEN_APP_ID);
     await Bun.sleep(1100);
-    await workOnce(db, github);
+    await workOnce(db, app, env.WARDEN_APP_ID);
     expect(gate()?.conclusion).toBe("success");
   });
 });
@@ -1275,24 +1373,24 @@ test("a delayed authorized label delivery cannot grant a later unauthorized appl
     action: "labeled",
     label: { name: "skip warden" },
   });
-  await workOnce(db, github);
-  await workOnce(db, github);
+  await workOnce(db, app, env.WARDEN_APP_ID);
+  await workOnce(db, app, env.WARDEN_APP_ID);
   expect(gate()?.conclusion).toBe("success");
   pr.labels = [];
   await webhook("pull_request", {
     action: "unlabeled",
     label: { name: "skip warden" },
   });
-  await workOnce(db, github);
-  await workOnce(db, github);
+  await workOnce(db, app, env.WARDEN_APP_ID);
+  await workOnce(db, app, env.WARDEN_APP_ID);
   pr.labels = [{ name: "skip warden" }];
   await webhook("pull_request", {
     action: "labeled",
     label: { name: "skip warden" },
     sender: { login: "mallory" },
   });
-  await workOnce(db, github);
-  await workOnce(db, github);
+  await workOnce(db, app, env.WARDEN_APP_ID);
+  await workOnce(db, app, env.WARDEN_APP_ID);
   await webhook(
     "pull_request",
     { action: "labeled", label: { name: "skip warden" } },
@@ -1300,8 +1398,8 @@ test("a delayed authorized label delivery cannot grant a later unauthorized appl
     true,
     false,
   );
-  await workOnce(db, github);
-  await workOnce(db, github);
+  await workOnce(db, app, env.WARDEN_APP_ID);
+  await workOnce(db, app, env.WARDEN_APP_ID);
   expect(gate()?.conclusion).toBe("failure");
   expect(
     (await rows(sql`SELECT bypass_actor FROM warden_prs`))[0]?.bypass_actor,
@@ -1317,8 +1415,8 @@ test("a missed label removal and reapplication invalidates the stored timeline g
     action: "labeled",
     label: { name: "skip warden" },
   });
-  await workOnce(db, github);
-  await workOnce(db, github);
+  await workOnce(db, app, env.WARDEN_APP_ID);
+  await workOnce(db, app, env.WARDEN_APP_ID);
   expect(gate()?.conclusion).toBe("success");
   state.timeline.push({
     id: state.nextId++,
@@ -1387,7 +1485,7 @@ test("passing observations after the deadline block until new activity renews ev
     check_run: fixtureCheck(1),
     pull_request: undefined,
   });
-  await workOnce(db, github);
+  await workOnce(db, app, env.WARDEN_APP_ID);
   await settle();
   expect(gate()?.conclusion).toBe("success");
 });
@@ -1558,8 +1656,8 @@ test("maintain-only bypass uses role_name; unknown and missing roles fail closed
     action: "labeled",
     label: { name: "skip warden" },
   });
-  await workOnce(db, github);
-  await workOnce(db, github);
+  await workOnce(db, app, env.WARDEN_APP_ID);
+  await workOnce(db, app, env.WARDEN_APP_ID);
   expect(gate()?.conclusion).toBe("success");
   state.roles.alice = "write";
   await reconcile(db, github, t, clock);
@@ -1616,7 +1714,7 @@ test("repository unarchive onboards and resumes suspended PRs", async () => {
   if (!repository) throw new Error("Missing repository");
   repository.archived = true;
   await webhook("repository", { action: "archived", pull_request: undefined });
-  await workOnce(db, github);
+  await workOnce(db, app, env.WARDEN_APP_ID);
   expect((await rows(sql`SELECT state FROM warden_prs`))[0]?.state).toBe(
     "suspended",
   );
@@ -1625,7 +1723,7 @@ test("repository unarchive onboards and resumes suspended PRs", async () => {
     action: "unarchived",
     pull_request: undefined,
   });
-  await workOnce(db, github);
+  await workOnce(db, app, env.WARDEN_APP_ID);
   expect((await rows(sql`SELECT state FROM warden_prs`))[0]?.state).toBe(
     "open",
   );
@@ -1678,7 +1776,7 @@ test("shared-head bypass is denied while all-normal passing evaluations remain p
     action: "labeled",
     label: { name: "skip warden" },
   });
-  await workOnce(db, github);
+  await workOnce(db, app, env.WARDEN_APP_ID);
   await reconcile(db, github, t, clock);
   await reconcile(db, github, { ...t, number: 2 }, clock);
   advance();
@@ -1721,8 +1819,8 @@ test("same-ID check reruns with newer start times invalidate stale success and r
 test("operational metrics count durable ingress, reconciliation and publication failures", async () => {
   state.checks = [fixtureCheck(1)];
   await webhook();
-  await workOnce(db, github);
-  await workOnce(db, github);
+  await workOnce(db, app, env.WARDEN_APP_ID);
+  await workOnce(db, app, env.WARDEN_APP_ID);
   expect(
     (
       await rows(
@@ -1795,7 +1893,7 @@ test.each(["installation", "repository"])(
   async (scope) => {
     state.checks = [fixtureCheck(1)];
     await webhook();
-    await workOnce(db, github);
+    await workOnce(db, app, env.WARDEN_APP_ID);
     await settle();
     await rows(sql`TRUNCATE warden_jobs`);
     state.pullDelayMs = 300;
@@ -1838,7 +1936,7 @@ test("bulk reactivation waits for head publication and atomically queues unready
   if (!pr) throw new Error("Missing PR");
   state.prs.push({ ...pr, number: 2 });
   await webhook();
-  await workOnce(db, github);
+  await workOnce(db, app, env.WARDEN_APP_ID);
   await reconcile(db, github, t, clock);
   await reconcile(db, github, { ...t, number: 2 }, clock);
   await changeLifecycle(db, 1, 10, "suspended");
@@ -1938,7 +2036,7 @@ test("PR lifecycle membership waits for the shared SHA publication lock", async 
     await webhook("pull_request", { action: "opened", pull_request: peer });
     const job = await claim(db, 10);
     if (!job) throw new Error("Missing delivery job");
-    delivery = processDelivery(db, github, job);
+    delivery = processDelivery(db, app, env.WARDEN_APP_ID, job);
     const until = Date.now() + 5000;
     let waiting = false;
     while (Date.now() < until) {
@@ -2016,7 +2114,7 @@ test.each(["onboarding", "check activity"])(
         });
         const job = await claim(db, 10);
         if (!job) throw new Error("Missing delivery job");
-        renewal = processDelivery(db, github, job);
+        renewal = processDelivery(db, app, env.WARDEN_APP_ID, job);
       }
       const until = Date.now() + 5000;
       let waiting = false;
@@ -2070,7 +2168,7 @@ test("a retried lifecycle delivery retains former-head recovery after its PR tra
   try {
     let failure: unknown;
     try {
-      await processDelivery(db, github, job);
+      await processDelivery(db, app, env.WARDEN_APP_ID, job);
     } catch (error) {
       failure = error;
     }
@@ -2093,7 +2191,7 @@ test("a retried lifecycle delivery retains former-head recovery after its PR tra
     );
   }
   // Retry the original claim, whose in-memory payload predates the committed intent.
-  await processDelivery(db, github, job);
+  await processDelivery(db, app, env.WARDEN_APP_ID, job);
   expect(
     (
       await rows(
@@ -2172,10 +2270,10 @@ test("reconciliation discovers missed peer closure and durably renews an expired
     )[0]?.payload,
   ).toMatchObject({ wardenRenew: true });
   time = new Date();
-  await workOnce(db, github, 10, clock);
+  await workOnce(db, app, env.WARDEN_APP_ID, 10, clock);
   advance();
   await rows(sql`UPDATE warden_jobs SET available_at=now()`);
-  await workOnce(db, github, 10, clock);
+  await workOnce(db, app, env.WARDEN_APP_ID, 10, clock);
   expect(gate()?.conclusion).toBe("success");
 });
 
@@ -2185,7 +2283,7 @@ test("closing the only blocking shared-head peer wakes and recovers remaining su
   await rows(sql`TRUNCATE warden_jobs`);
   peer.state = "closed";
   await webhook("pull_request", { action: "closed", pull_request: peer });
-  await workOnce(db, github);
+  await workOnce(db, app, env.WARDEN_APP_ID);
   expect(
     (
       await rows(
@@ -2208,7 +2306,7 @@ test("a force-push leaving a shared head wakes the former group", async () => {
   peer.head = { sha: "d".repeat(40) };
   peer.merge_commit_sha = null;
   await webhook("pull_request", { action: "synchronize", pull_request: peer });
-  await workOnce(db, github);
+  await workOnce(db, app, env.WARDEN_APP_ID);
   expect(
     (
       await rows(
@@ -2234,7 +2332,7 @@ test("a peer's merge rerun renews expired shared-head evaluations and recovers t
     check_run: rerun,
     pull_request: undefined,
   });
-  await workOnce(db, github);
+  await workOnce(db, app, env.WARDEN_APP_ID);
   expect(
     (
       await rows(
@@ -2372,7 +2470,7 @@ test("authenticated rerequest invalidates the central gate cache and republishes
     check_run: current,
     pull_request: undefined,
   });
-  await workOnce(db, github);
+  await workOnce(db, app, env.WARDEN_APP_ID);
   expect(
     (await rows(sql`SELECT published_hash FROM warden_gates`))[0]
       ?.published_hash,
@@ -2405,8 +2503,8 @@ for (const conclusion of ["neutral", "skipped"]) {
       check_run: fixtureCheck(1, conclusion),
       pull_request: undefined,
     });
-    await workOnce(db, github);
-    await workOnce(db, github);
+    await workOnce(db, app, env.WARDEN_APP_ID);
+    await workOnce(db, app, env.WARDEN_APP_ID);
     expect(gate()?.conclusion).toBe("failure");
     expect(state.comments[0]?.body).toContain(conclusion);
   });
@@ -2462,8 +2560,8 @@ test("timestamp-less same-ID queue receipts require fresh stability and are retr
   });
   const delivery = await claim(db, 10);
   if (delivery?.kind !== "delivery") throw new Error("Missing queued delivery");
-  await processDelivery(db, github, delivery);
-  await processDelivery(db, github, delivery);
+  await processDelivery(db, app, env.WARDEN_APP_ID, delivery);
+  await processDelivery(db, app, env.WARDEN_APP_ID, delivery);
   expect(
     (await rows(sql`SELECT generation,stable_since FROM warden_prs`))[0],
   ).toMatchObject({ generation: Number(before) + 1, stable_since: null });
@@ -2798,7 +2896,7 @@ test("a failed bypass-removal delivery blocks until its durable work recovers", 
       label: { name: "skip warden" },
     }),
   );
-  await workOnce(db, github);
+  await workOnce(db, app, env.WARDEN_APP_ID);
   expect(gate()?.conclusion).toBe("success");
   pr.labels = [];
   await webhook("pull_request", {
@@ -2806,21 +2904,21 @@ test("a failed bypass-removal delivery blocks until its durable work recovers", 
     label: { name: "skip warden" },
   });
   state.errorPath = "pulls";
-  await workOnce(db, github);
+  await workOnce(db, app, env.WARDEN_APP_ID);
   const failed = (
     await rows(
       sql`SELECT id FROM warden_jobs WHERE kind='delivery' AND last_error IS NOT NULL`,
     )
   )[0];
   expect(failed).toBeDefined();
-  await workOnce(db, github);
+  await workOnce(db, app, env.WARDEN_APP_ID);
   expect(gate()?.conclusion).toBe("failure");
   expect(state.comments[0]?.body).toContain("failed webhook delivery");
   await rows(
     sql`UPDATE warden_jobs SET available_at=now()-interval '1 second' WHERE id=${String(failed?.id)}::uuid`,
   );
-  await workOnce(db, github);
-  await workOnce(db, github);
+  await workOnce(db, app, env.WARDEN_APP_ID);
+  await workOnce(db, app, env.WARDEN_APP_ID);
   expect(gate()?.conclusion).toBe("failure");
   expect(
     (await rows(sql`SELECT bypass_actor FROM warden_prs`))[0]?.bypass_actor,
@@ -2849,7 +2947,7 @@ test("failed opening of an untracked shared-head PR blocks the existing green ga
     pull_request: state.prs[1],
   });
   state.errorPath = "pulls";
-  await workOnce(db, github);
+  await workOnce(db, app, env.WARDEN_APP_ID);
   await reconcile(db, github, t, clock);
   expect(gate()?.conclusion).toBe("failure");
   expect(
@@ -2925,11 +3023,11 @@ test("overlapping failed deliveries retain every unresolved recovery barrier", a
     (await rows(sql`SELECT delivery_error_jobs FROM warden_prs`))[0]
       ?.delivery_error_jobs,
   ).toHaveLength(2);
-  await processDelivery(db, github, first);
+  await processDelivery(db, app, env.WARDEN_APP_ID, first);
   await finish(db, first);
   await reconcile(db, github, t, clock);
   expect(gate()?.conclusion).toBe("failure");
-  await processDelivery(db, github, second);
+  await processDelivery(db, app, env.WARDEN_APP_ID, second);
   await finish(db, second);
   time = new Date();
   await settle();
@@ -2943,20 +3041,17 @@ test("overlapping failed deliveries retain every unresolved recovery barrier", a
 test("a lifecycle API error cannot leave success while its delivery is unresolved", async () => {
   state.checks = [fixtureCheck(1)];
   await settle();
-  const read = github.installationState.bind(github);
-  github.installationState = async () => {
-    throw new Error("Installation state unavailable");
-  };
+  state.errorPath = "/app/installations/";
+  state.errorStatus = 500;
   await webhook("installation", {
     action: "suspend",
     repository: undefined,
     pull_request: undefined,
   });
-  await workOnce(db, github);
-  await workOnce(db, github);
+  await workOnce(db, app, env.WARDEN_APP_ID);
+  await workOnce(db, app, env.WARDEN_APP_ID);
   expect(gate()?.conclusion).toBe("failure");
   expect(state.comments[0]?.body).toContain("failed webhook delivery");
-  github.installationState = read;
   expect(await onboardInstallation(db, github, 1)).toBe(1);
   time = new Date();
   await settle();
@@ -2978,21 +3073,21 @@ test("an unknown current merge signal with failed association lookup blocks and 
     pull_request: undefined,
   });
   state.errorPath = `commits/${merge}/pulls`;
-  await workOnce(db, github);
+  await workOnce(db, app, env.WARDEN_APP_ID);
   const delivery = (
     await rows(
       sql`SELECT id FROM warden_jobs WHERE kind='delivery' AND last_error IS NOT NULL`,
     )
   )[0];
   expect(delivery).toBeDefined();
-  await workOnce(db, github);
+  await workOnce(db, app, env.WARDEN_APP_ID);
   expect(gate()?.conclusion).toBe("failure");
   expect(state.comments[0]?.body).toContain("failed webhook delivery");
   await rows(
     sql`UPDATE warden_jobs SET available_at=now()-interval '1 second' WHERE id=${String(delivery?.id)}::uuid`,
   );
-  await workOnce(db, github);
-  await workOnce(db, github);
+  await workOnce(db, app, env.WARDEN_APP_ID);
+  await workOnce(db, app, env.WARDEN_APP_ID);
   expect(gate()?.conclusion).toBe("failure");
   expect(state.comments[0]?.body).toContain("Check: merge tests (failure)");
   expect(
@@ -3164,7 +3259,7 @@ async function evaluateEvent(event: string, data: Record<string, unknown>) {
   await drainDelivery(
     await webhook(event, { ...data, pull_request: undefined }),
   );
-  await workOnce(db, github, 10, clock);
+  await workOnce(db, app, env.WARDEN_APP_ID, 10, clock);
 }
 
 test("event failure uses tracked state without full scans and preserves scheduled recovery", async () => {
@@ -3297,7 +3392,7 @@ test("SDK dispatch retains rate-limit delays on failed durable deliveries", asyn
   state.errorPath = "pulls";
   state.errorStatus = 429;
   await webhook();
-  await workOnce(db, github);
+  await workOnce(db, app, env.WARDEN_APP_ID);
   const failed = (
     await rows(
       sql`SELECT extract(epoch from available_at-now()) AS delay FROM warden_jobs WHERE kind='delivery' AND last_error IS NOT NULL`,
@@ -3493,7 +3588,7 @@ for (const mode of ["app", "api", "worker"] as const) {
           PORT: String(port),
           WARDEN_WORKER_HEALTH_PORT: String(port),
           WARDEN_PRIVATE_KEY_FILE: "",
-          WARDEN_PRIVATE_KEY: "",
+          WARDEN_PRIVATE_KEY: env.privateKey,
         },
         stdout: "pipe",
         stderr: "pipe",

@@ -4,10 +4,9 @@ x-warden-env: &warden-env
   # Local tooling always uses the fixture, even in a production-configured shell.
   WARDEN_WEBHOOK_SECRET: warden-local-webhook-secret
   WARDEN_APP_ID: 1
-  WARDEN_PRIVATE_KEY_FILE: ""
+  WARDEN_PRIVATE_KEY_FILE: /run/fixture/private-key.pem
   WARDEN_PRIVATE_KEY: ""
   WARDEN_GITHUB_API_URL: http://github:4000
-  WARDEN_DEMO: "true"
   WARDEN_WORKER_POLL_MS: 100
   WARDEN_JOB_LEASE_SECONDS: 10
 services:
@@ -33,7 +32,8 @@ services:
       postgres: {condition: service_healthy}
   github:
     build: {context: ., target: development}
-    command: [bun, run, demo:github]
+    command: [bun, run, demo:github, /run/fixture/private-key.pem]
+    volumes: [fixture-key:/run/fixture]
     environment: {PORT: 4000}
     healthcheck:
       test: [CMD, bun, -e, 'if (!(await fetch("http://localhost:4000/health")).ok) process.exit(1)']
@@ -44,6 +44,7 @@ services:
   api:
     build: {context: ., target: api}
     environment: *warden-env
+    volumes: [fixture-key:/run/fixture:ro]
     ports: ["127.0.0.1:${WARDEN_PORT:-3000}:3000"]
     depends_on:
       migrate: {condition: service_completed_successfully}
@@ -57,6 +58,7 @@ services:
   worker:
     build: {context: ., target: worker}
     environment: *warden-env
+    volumes: [fixture-key:/run/fixture:ro]
     depends_on:
       migrate: {condition: service_completed_successfully}
       github: {condition: service_healthy}
@@ -79,4 +81,5 @@ services:
     depends_on:
       api: {condition: service_healthy}
 volumes:
+  fixture-key:
   warden-data:

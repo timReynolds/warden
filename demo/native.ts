@@ -1,4 +1,5 @@
 // Uses existing local PostgreSQL. This proves processes/HTTP, not container builds.
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -11,17 +12,18 @@ if (
   throw new Error(
     "Native demo requires a fresh local warden_demo PostgreSQL database",
   );
+const directory = await mkdtemp(join(tmpdir(), "warden-native-"));
+const privateKeyFile = join(directory, "private-key.pem");
 const runtime = process.execPath;
 const environment = {
   ...process.env,
   DATABASE_URL: url,
-  WARDEN_DEMO: "true",
   WARDEN_APP_ID: "1",
   WARDEN_WEBHOOK_SECRET: "warden-local-webhook-secret",
   WARDEN_GITHUB_API_URL: "http://127.0.0.1:3810",
   WARDEN_API_URL: "http://127.0.0.1:3800",
   WARDEN_PRIVATE_KEY: "",
-  WARDEN_PRIVATE_KEY_FILE: "",
+  WARDEN_PRIVATE_KEY_FILE: privateKeyFile,
   WARDEN_WORKER_POLL_MS: "100",
   WARDEN_JOB_LEASE_SECONDS: "10",
   WARDEN_WORKER_HEALTH_PORT: "3830",
@@ -30,11 +32,16 @@ const services: Bun.Subprocess[] = [];
 function start(
   path: string,
   extra: Record<string, string> = {},
-  mode?: "api" | "worker",
+  args: string[] = [],
 ) {
-  const process = Bun.spawn([runtime, "run", path, ...(mode ? [mode] : [])], {
+  const process = Bun.spawn([runtime, "run", path, ...args], {
     env: { ...environment, ...extra },
-    stdout: Bun.file(join(tmpdir(), `warden-native-${mode ?? "github"}.log`)),
+    stdout: Bun.file(
+      join(
+        tmpdir(),
+        `warden-native-${path === "demo/github.ts" ? "github" : args[0]}.log`,
+      ),
+    ),
     stderr: "inherit",
   });
   services.push(process);
@@ -62,20 +69,21 @@ async function ready(url: string) {
 try {
   await run("build");
   await run("dist/db/migrate.js");
-  start("demo/github.ts", { PORT: "3810" });
+  start("demo/github.ts", { PORT: "3810" }, [privateKeyFile]);
   await ready("http://127.0.0.1:3810/health");
-  start("dist/app.js", { PORT: "3800" }, "api");
+  start("dist/app.js", { PORT: "3800" }, ["api"]);
   await ready("http://127.0.0.1:3800/ready");
-  let worker = start("dist/app.js", {}, "worker");
+  let worker = start("dist/app.js", {}, ["worker"]);
   await run("demo/run.ts");
   worker.kill("SIGTERM");
   await worker.exited;
   await run("demo/run.ts", ["prepare-restart"]);
-  worker = start("dist/app.js", {}, "worker");
+  worker = start("dist/app.js", {}, ["worker"]);
   await run("demo/run.ts", ["verify-restart"]);
 } finally {
   for (const service of services) {
     if (service.exitCode === null) service.kill("SIGTERM");
   }
   await Promise.all(services.map((service) => service.exited));
+  await rm(directory, { recursive: true, force: true });
 }
