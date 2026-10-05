@@ -79,8 +79,6 @@ validating your Warden policy. A label bypass affects only Warden's check.
   environment variables, health checks, and troubleshooting.
 - [Configuration](docs/configuration.md): repository policy, ignore patterns,
   discovery timing, and bypass rules.
-- [PostgreSQL upgrades](docs/postgresql-upgrade.md): preserving data when moving
-  an existing PostgreSQL 17 deployment to PostgreSQL 18.
 - [Contributing](CONTRIBUTING.md): local checks, integration tests, and changes.
 
 ## License

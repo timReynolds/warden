@@ -33,8 +33,7 @@ settings.
 
 ## Deploy with Docker Compose
 
-Run these commands from the repository root. Docker Compose v2 is required;
-the PostgreSQL upgrade procedure requires 2.24.4 or newer.
+Run these commands from the repository root. Docker Compose v2 is required.
 
 ```sh
 cp .env.example .env
@@ -173,6 +172,5 @@ job identifiers for diagnosis. Both processes shut down on `SIGTERM` or `SIGINT`
 Back up PostgreSQL and protect the backup as repository data. Warden retains
 delivery payloads and operational history; account for database growth and your
 retention requirements. Do not remove its volume during routine upgrades.
-Read the [PostgreSQL upgrade guide](postgresql-upgrade.md) before changing an
-existing PostgreSQL 17 deployment to PostgreSQL 18. Application migrations are
-ordered, checksummed SQL files and must run before starting an upgraded app.
+Application migrations are ordered, checksummed SQL files and must run before
+starting an upgraded app.
