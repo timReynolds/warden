@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { EmitterWebhookEvent } from "@octokit/webhooks";
 import { sql } from "drizzle-orm";
+import type { App } from "octokit";
 import { z } from "zod";
 import type { Database } from "./db";
 import {
@@ -11,7 +12,7 @@ import {
   lockLifecycle,
 } from "./db/prs";
 import { enqueue, type Job } from "./db/queue";
-import { GitHub, type GitHubApp } from "./github";
+import { GitHub } from "./github";
 import {
   changeLifecycle,
   lifecycleActive,
@@ -115,11 +116,11 @@ const handledEvents = [
   "repository",
 ] as const;
 const processors = new WeakMap<
-  GitHubApp,
+  App,
   (db: Database, job: Job) => Promise<void>
 >();
 
-function createDeliveryProcessor(app: GitHubApp, appId: number) {
+function createDeliveryProcessor(app: App, appId: number) {
   const context = new AsyncLocalStorage<{ db: Database; job: Job }>();
   app.webhooks.on([...handledEvents], async ({ octokit, payload }) => {
     const delivery = context.getStore();
@@ -151,7 +152,7 @@ function createDeliveryProcessor(app: GitHubApp, appId: number) {
 
 export async function processDelivery(
   db: Database,
-  app: GitHubApp,
+  app: App,
   appId: number,
   job: Job,
 ) {

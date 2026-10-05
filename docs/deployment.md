@@ -121,10 +121,9 @@ for substitution and passes the variables listed in the Compose file.
 | `DATABASE_URL` | Required PostgreSQL connection URL |
 | `WARDEN_APP_ID` | Required positive GitHub App ID |
 | `WARDEN_WEBHOOK_SECRET` | Required; at least 16 characters |
-| `WARDEN_PRIVATE_KEY_FILE` | Path to PEM key; required in production unless an inline key is supplied |
+| `WARDEN_PRIVATE_KEY_FILE` | Path to PEM key; required unless an inline key is supplied |
 | `WARDEN_PRIVATE_KEY` | Alternative inline PEM; escaped `\n` is supported; file takes precedence |
 | `WARDEN_GITHUB_API_URL` | `https://api.github.com`; set your enterprise API URL if needed |
-| `WARDEN_DEMO` | `false`; `true` only works with a local HTTP GitHub fixture |
 | `PORT` | `3000` for native API / combined process |
 | `WARDEN_WORKER_HEALTH_PORT` | `3001` for the native worker health server |
 | `WARDEN_JOB_LEASE_SECONDS` | `60`; range 5–600 seconds |

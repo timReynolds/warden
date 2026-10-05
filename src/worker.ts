@@ -1,10 +1,11 @@
 import { sql } from "drizzle-orm";
+import type { App } from "octokit";
 import { z } from "zod";
 import type { Database } from "./db";
 import { claim, enqueue, fail, finish, heartbeat } from "./db/queue";
 import type { Env } from "./env";
 import { processDelivery, recoverFailedDelivery } from "./events";
-import { createApp, GitHub, type GitHubApp } from "./github";
+import { createApp, GitHub } from "./github";
 import { type Controls, reconcile } from "./reconcile";
 
 const target = z.object({
@@ -16,7 +17,7 @@ const target = z.object({
 });
 export async function workOnce(
   db: Database,
-  app: GitHubApp,
+  app: App,
   appId: number,
   leaseSeconds = 60,
   controls?: Controls,
@@ -129,7 +130,7 @@ export function createGitHubApp(db: Database, env: Env) {
 
 export async function runWorker(
   db: Database,
-  app: GitHubApp,
+  app: App,
   env: Env,
   signal: AbortSignal,
 ) {

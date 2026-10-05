@@ -1,5 +1,6 @@
 // Test-only HTTP fixture. Production uses Octokit.
 
+import { createPublicKey, generateKeyPairSync, verify } from "node:crypto";
 import { type Context, Hono } from "hono";
 import { z } from "zod";
 import { CHECK_NAME } from "../src/model";
@@ -164,9 +165,52 @@ export function fixtureCheck(
     html_url: `http://github.local/checks/${id}`,
   };
 }
-export function createFixture(initial = initialState()) {
+export function createFixture(
+  initial = initialState(),
+  privateKey = generateKeyPairSync("rsa", { modulusLength: 2048 })
+    .privateKey.export({ type: "pkcs8", format: "pem" })
+    .toString(),
+) {
   let state = initial;
   const app = new Hono();
+  const publicKey = createPublicKey(privateKey);
+  const token = "warden-fixture-installation-token";
+  function appAuthenticated(authorization = "") {
+    try {
+      const [header, payload, signature] = authorization
+        .replace(/^Bearer /i, "")
+        .split(".");
+      if (!header || !payload || !signature) return false;
+      const claims = JSON.parse(Buffer.from(payload, "base64url").toString());
+      return (
+        JSON.parse(Buffer.from(header, "base64url").toString()).alg ===
+          "RS256" &&
+        String(claims.iss) === "1" &&
+        claims.exp > Date.now() / 1000 &&
+        verify(
+          "RSA-SHA256",
+          Buffer.from(`${header}.${payload}`),
+          publicKey,
+          Buffer.from(signature, "base64url"),
+        )
+      );
+    } catch {
+      return false;
+    }
+  }
+  app.post("/app/installations/:id/access_tokens", (c) =>
+    appAuthenticated(c.req.header("authorization"))
+      ? c.json(
+          {
+            token,
+            expires_at: new Date(Date.now() + 3600000).toISOString(),
+            permissions: {},
+            repository_selection: "selected",
+          },
+          201,
+        )
+      : c.json({ message: "Invalid fixture App JWT" }, 401),
+  );
   // Admin endpoints exist only in this fixture, on a dedicated demo network.
   app.get("/health", (c) =>
     c.json({ status: "ok", service: "warden-fake-github" }),
@@ -213,9 +257,13 @@ export function createFixture(initial = initialState()) {
         },
       );
     }
+    const authorization = c.req.header("authorization") ?? "";
+    const appRequest =
+      c.req.path.startsWith("/app/") || c.req.path.endsWith("/installation");
     if (
-      c.req.header("authorization") !== "token warden-local-demo" &&
-      c.req.header("authorization") !== "Bearer warden-local-demo"
+      appRequest
+        ? !appAuthenticated(authorization)
+        : authorization.replace(/^(token|Bearer) /i, "") !== token
     )
       return c.json({ message: "Unauthorized fixture request" }, 401);
     if (state.pullDelayMs > 0 && /\/pulls\/\d+$/.test(c.req.path)) {
@@ -502,12 +550,18 @@ export function createFixture(initial = initialState()) {
     Object.assign(comment, await c.req.json());
     return c.json(comment);
   });
-  return { app, getState: () => state };
+  return { app, privateKey, getState: () => state };
 }
 if (import.meta.main) {
+  const keyFile = process.argv[2] ? Bun.file(process.argv[2]) : undefined;
+  const fixture = createFixture(
+    initialState(),
+    keyFile && (await keyFile.exists()) ? await keyFile.text() : undefined,
+  );
+  if (keyFile) await Bun.write(keyFile, fixture.privateKey);
   const server = Bun.serve({
     port: Number(process.env.PORT ?? 4000),
-    fetch: createFixture().app.fetch,
+    fetch: fixture.app.fetch,
   });
   console.log(
     `Warden fixture GitHub HTTP service on ${server.port}; aggregate ${CHECK_NAME}`,

@@ -1,5 +1,4 @@
 import type { RequestInterface, RequestParameters } from "@octokit/types";
-import { Webhooks } from "@octokit/webhooks";
 import { App, Octokit, RequestError } from "octokit";
 import { z } from "zod";
 import type { Env } from "./env";
@@ -120,17 +119,6 @@ export function createApp(
     retry: { enabled: false },
     throttle: { enabled: false },
   });
-  if (env.WARDEN_DEMO === "true") {
-    const client = new Client({ auth: "warden-local-demo" });
-    return {
-      getInstallationOctokit: async (_installationId: number) => client,
-      webhooks: new Webhooks({
-        secret: env.WARDEN_WEBHOOK_SECRET,
-        transform: (event) => ({ ...event, octokit: client }),
-      }),
-    };
-  }
-  if (!env.privateKey) throw new Error("GitHub App private key required");
   return new App({
     appId: env.WARDEN_APP_ID,
     privateKey: env.privateKey,
@@ -138,7 +126,6 @@ export function createApp(
     webhooks: { secret: env.WARDEN_WEBHOOK_SECRET },
   });
 }
-export type GitHubApp = ReturnType<typeof createApp>;
 
 export class GitHub {
   constructor(

@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Webhooks } from "@octokit/webhooks";
 import { sql } from "drizzle-orm";
+import type { App } from "octokit";
 import {
   createFixture,
   type FixtureState,
@@ -25,7 +26,7 @@ import { migrate } from "../src/db/migrate";
 import { claim, enqueue, fail, finish } from "../src/db/queue";
 import type { Env } from "../src/env";
 import { processDelivery, recoverFailedDelivery } from "../src/events";
-import { createApp, GitHub, type GitHubApp, GitHubError } from "../src/github";
+import { createApp, GitHub, GitHubError } from "../src/github";
 import {
   changeLifecycle,
   onboardInstallation,
@@ -62,7 +63,7 @@ let state: FixtureState;
 const fixture = createFixture();
 const http = Bun.serve({ port: 0, fetch: fixture.app.fetch });
 const api = Bun.serve({ port: 0, fetch: createApi(db, webhooks).fetch });
-let app: GitHubApp;
+let app: App;
 let github: GitHub;
 let time: Date;
 const clock = { now: () => time, jitter: () => 0.5 };
@@ -75,10 +76,9 @@ const env: Env = {
   PORT: 3000,
   WARDEN_APP_ID: 1,
   WARDEN_GITHUB_API_URL: http.url.toString().replace(/\/$/, ""),
-  WARDEN_DEMO: "true",
   WARDEN_JOB_LEASE_SECONDS: 10,
   WARDEN_WORKER_POLL_MS: 100,
-  privateKey: undefined,
+  privateKey: fixture.privateKey,
 };
 const gate = () => state.checks.filter((c) => c.name === CHECK_NAME).at(-1);
 async function rows(query: ReturnType<typeof sql>) {
@@ -162,6 +162,31 @@ afterAll(async () => {
   await api.stop();
   await http.stop();
   await close();
+});
+
+test("application configuration requires a GitHub App private key", async () => {
+  const child = Bun.spawn(
+    [
+      process.execPath,
+      "-e",
+      'import { readEnv } from "./src/env"; await readEnv();',
+    ],
+    {
+      env: {
+        DATABASE_URL: databaseUrl,
+        WARDEN_APP_ID: "1",
+        WARDEN_WEBHOOK_SECRET: secret,
+        WARDEN_PRIVATE_KEY: "",
+        WARDEN_PRIVATE_KEY_FILE: "",
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    },
+  );
+  expect(await child.exited).not.toBe(0);
+  expect(await new Response(child.stderr).text()).toContain(
+    "Set WARDEN_PRIVATE_KEY_FILE or WARDEN_PRIVATE_KEY",
+  );
 });
 
 test("policy revisions and errors survive client restarts without refetching", async () => {
@@ -273,7 +298,6 @@ test("production App authentication caches tokens and isolates concurrent instal
   try {
     const app = createApp({
       ...env,
-      WARDEN_DEMO: "false",
       WARDEN_GITHUB_API_URL: service.url.toString().replace(/\/$/, ""),
       privateKey,
     });
@@ -348,6 +372,8 @@ test("Octokit follows Link headers across short pages without duplicating query 
     port: 0,
     fetch: (request) => {
       const url = new URL(request.url);
+      if (url.pathname.endsWith("/access_tokens"))
+        return fixture.app.fetch(request);
       expect(url.pathname).toBe("/repos/acme/repo/pulls");
       expect(url.searchParams.getAll("page")).toHaveLength(1);
       expect(url.searchParams.getAll("per_page")).toEqual(["100"]);
@@ -397,7 +423,9 @@ for (const { name, response } of [
     let requests = 0;
     const service = Bun.serve({
       port: 0,
-      fetch: () => {
+      fetch: (request) => {
+        if (new URL(request.url).pathname.endsWith("/access_tokens"))
+          return fixture.app.fetch(request);
         requests++;
         return Response.json(response);
       },
@@ -424,6 +452,8 @@ test("pagination stops at Warden's request bound even with an endless next link"
   const service = Bun.serve({
     port: 0,
     fetch: (request) => {
+      if (new URL(request.url).pathname.endsWith("/access_tokens"))
+        return fixture.app.fetch(request);
       requests++;
       return Response.json([], {
         headers: { link: `<${request.url}>; rel="next"` },
@@ -3558,7 +3588,7 @@ for (const mode of ["app", "api", "worker"] as const) {
           PORT: String(port),
           WARDEN_WORKER_HEALTH_PORT: String(port),
           WARDEN_PRIVATE_KEY_FILE: "",
-          WARDEN_PRIVATE_KEY: "",
+          WARDEN_PRIVATE_KEY: env.privateKey,
         },
         stdout: "pipe",
         stderr: "pipe",
