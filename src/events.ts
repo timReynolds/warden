@@ -11,7 +11,7 @@ import {
   lockLifecycle,
 } from "./db/prs";
 import { enqueue, type Job } from "./db/queue";
-import type { GitHub } from "./github";
+import { GitHub, type GitHubApp } from "./github";
 import {
   changeLifecycle,
   lifecycleActive,
@@ -115,30 +115,26 @@ const handledEvents = [
   "repository",
 ] as const;
 const processors = new WeakMap<
-  GitHub,
+  GitHubApp,
   (db: Database, job: Job) => Promise<void>
 >();
 
-function createDeliveryProcessor(github: GitHub) {
+function createDeliveryProcessor(app: GitHubApp, appId: number) {
   const context = new AsyncLocalStorage<{ db: Database; job: Job }>();
-  github.webhooks.on([...handledEvents], async ({ octokit, payload }) => {
+  app.webhooks.on([...handledEvents], async ({ octokit, payload }) => {
     const delivery = context.getStore();
     if (!delivery) throw new Error("Warden delivery missing durable job");
     const installationId =
       "installation" in payload ? payload.installation?.id : undefined;
     if (!installationId) throw new Error("Warden event missing installation");
-    await github.withClient(
-      installationId,
-      () => handleDelivery(delivery.db, github, delivery.job),
-      octokit,
-    );
+    await handleDelivery(delivery.db, new GitHub(octokit, appId), delivery.job);
   });
   return async (db: Database, job: Job) => {
     try {
       // Signed ingress already persisted this payload; runtime fields used by
       // the gate are still validated in handleDelivery, not trusted from types.
       await context.run({ db, job }, () =>
-        github.webhooks.receive({
+        app.webhooks.receive({
           id: String(job.payload.deliveryId),
           name: String(job.payload.event),
           payload: job.payload,
@@ -153,11 +149,16 @@ function createDeliveryProcessor(github: GitHub) {
   };
 }
 
-export async function processDelivery(db: Database, github: GitHub, job: Job) {
-  let process = processors.get(github);
+export async function processDelivery(
+  db: Database,
+  app: GitHubApp,
+  appId: number,
+  job: Job,
+) {
+  let process = processors.get(app);
   if (!process) {
-    process = createDeliveryProcessor(github);
-    processors.set(github, process);
+    process = createDeliveryProcessor(app, appId);
+    processors.set(app, process);
   }
   return process(db, job);
 }

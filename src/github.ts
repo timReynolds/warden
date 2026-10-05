@@ -1,4 +1,3 @@
-import { AsyncLocalStorage } from "node:async_hooks";
 import type { RequestInterface, RequestParameters } from "@octokit/types";
 import { Webhooks } from "@octokit/webhooks";
 import { App, Octokit, RequestError } from "octokit";
@@ -72,105 +71,84 @@ export class GitHubError extends Error {
     super(message);
   }
 }
-export class GitHub {
-  private client: (installationId: number) => Promise<Octokit>;
-  private clientScope = new AsyncLocalStorage<{
-    installationId: number;
-    client: Octokit;
-  }>();
-  public readonly webhooks: Webhooks<{ octokit: Octokit }>;
-  public requests = 0;
-  public readonly appId: number;
-  constructor(
-    env: Env,
-    observe?: (route: string, status: number) => Promise<void>,
-  ) {
-    this.appId = env.WARDEN_APP_ID;
-    const Client = Octokit.plugin((client) => {
-      client.hook.wrap("request", async (request, options) => {
-        options.headers["x-github-api-version"] = "2022-11-28";
-        const route = `${options.method} ${options.url}`;
-        this.requests++;
-        try {
-          const response = await request(options);
-          if (response.data == null)
-            throw new Error("GitHub returned an empty response body");
-          await observe?.(route, response.status);
-          return response;
-        } catch (error) {
-          await observe?.(
-            route,
-            error instanceof RequestError ? error.status : 0,
-          );
-          if (error instanceof RequestError) {
-            // Octokit's pagination treats 409 as an empty repository. Warden
-            // must keep observation errors blocking, never count an empty scan.
-            if (error.status === 409)
-              throw new Error("GitHub conflict; observation incomplete", {
-                cause: error,
-              });
-            if (error.status === 429 || error.status === 403) {
-              const headers = error.response?.headers;
-              const wait = Math.max(
-                60,
-                Number(headers?.["retry-after"]) || 0,
-                (Number(headers?.["x-ratelimit-reset"]) || 0) -
-                  Date.now() / 1000,
-              );
-              throw new GitHubError(
-                "GitHub permission/rate-limit error; retry deferred",
-                Math.min(86400, wait),
-              );
-            }
+export function createApp(
+  env: Env,
+  observe?: (route: string, status: number) => Promise<void>,
+) {
+  const Client = Octokit.plugin((client) => {
+    client.hook.wrap("request", async (request, options) => {
+      options.headers["x-github-api-version"] = "2022-11-28";
+      const route = `${options.method} ${options.url}`;
+      try {
+        const response = await request(options);
+        if (response.data == null)
+          throw new Error("GitHub returned an empty response body");
+        await observe?.(route, response.status);
+        return response;
+      } catch (error) {
+        await observe?.(
+          route,
+          error instanceof RequestError ? error.status : 0,
+        );
+        if (error instanceof RequestError) {
+          // Octokit's pagination treats 409 as an empty repository. Warden
+          // must keep observation errors blocking, never count an empty scan.
+          if (error.status === 409)
+            throw new Error("GitHub conflict; observation incomplete", {
+              cause: error,
+            });
+          if (error.status === 429 || error.status === 403) {
+            const headers = error.response?.headers;
+            const wait = Math.max(
+              60,
+              Number(headers?.["retry-after"]) || 0,
+              (Number(headers?.["x-ratelimit-reset"]) || 0) - Date.now() / 1000,
+            );
+            throw new GitHubError(
+              "GitHub permission/rate-limit error; retry deferred",
+              Math.min(86400, wait),
+            );
           }
-          throw error;
         }
-      });
-    }).defaults({
-      baseUrl: env.WARDEN_GITHUB_API_URL,
-      request: { timeout: 10000 },
-      // The durable queue owns retries, including ambiguous write recovery.
-      retry: { enabled: false },
-      throttle: { enabled: false },
+        throw error;
+      }
     });
-    if (env.WARDEN_DEMO === "true") {
-      const client = new Client({ auth: "warden-local-demo" });
-      this.client = async () => client;
-      this.webhooks = new Webhooks({
+  }).defaults({
+    baseUrl: env.WARDEN_GITHUB_API_URL,
+    request: { timeout: 10000 },
+    // The durable queue owns retries, including ambiguous write recovery.
+    retry: { enabled: false },
+    throttle: { enabled: false },
+  });
+  if (env.WARDEN_DEMO === "true") {
+    const client = new Client({ auth: "warden-local-demo" });
+    return {
+      getInstallationOctokit: async (_installationId: number) => client,
+      webhooks: new Webhooks({
         secret: env.WARDEN_WEBHOOK_SECRET,
         transform: (event) => ({ ...event, octokit: client }),
-      });
-    } else {
-      if (!env.privateKey) throw new Error("GitHub App private key required");
-      const app = new App({
-        appId: this.appId,
-        privateKey: env.privateKey,
-        Octokit: Client,
-        webhooks: { secret: env.WARDEN_WEBHOOK_SECRET },
-      });
-      this.webhooks = app.webhooks;
-      this.client = (installationId) => {
-        const current = this.clientScope.getStore();
-        if (current?.installationId === installationId)
-          return Promise.resolve(current.client);
-        return app.getInstallationOctokit(installationId);
-      };
-    }
+      }),
+    };
   }
-  async withClient<T>(
-    installationId: number,
-    run: () => Promise<T>,
-    client?: Octokit,
-  ) {
-    return this.clientScope.run(
-      { installationId, client: client ?? (await this.client(installationId)) },
-      run,
-    );
-  }
+  if (!env.privateKey) throw new Error("GitHub App private key required");
+  return new App({
+    appId: env.WARDEN_APP_ID,
+    privateKey: env.privateKey,
+    Octokit: Client,
+    webhooks: { secret: env.WARDEN_WEBHOOK_SECRET },
+  });
+}
+export type GitHubApp = ReturnType<typeof createApp>;
+
+export class GitHub {
+  constructor(
+    private readonly client: Octokit,
+    public readonly appId: number,
+  ) {}
   async installationState(
     installationId: number,
   ): Promise<"active" | "suspended" | "removed"> {
-    const client = await this.client(installationId);
+    const client = this.client;
     try {
       // auth-app selects JWT authentication for this App endpoint, including
       // suspended installations whose installation tokens cannot be used.
@@ -193,7 +171,7 @@ export class GitHub {
     }
   }
   async repository(t: Target): Promise<RepositoryIdentity> {
-    const client = await this.client(t.installationId);
+    const client = this.client;
     if (t.owner && t.repo) {
       try {
         const installation = z.object({ id: z.number() }).parse(
@@ -306,15 +284,15 @@ export class GitHub {
     return results;
   }
   async openPulls(t: Target) {
-    const client = await this.client(t.installationId);
+    const client = this.client;
     return this.pages(client, client.rest.pulls.list, {
       owner: t.owner,
       repo: t.repo,
       state: "open",
     });
   }
-  async repositories(installationId: number) {
-    const client = await this.client(installationId);
+  async repositories() {
+    const client = this.client;
     return this.pages(
       client,
       client.rest.apps.listReposAccessibleToInstallation,
@@ -322,7 +300,7 @@ export class GitHub {
     );
   }
   async pull(t: Target): Promise<PullRequest> {
-    const client = await this.client(t.installationId);
+    const client = this.client;
     const read = async (target: Target) =>
       (
         await client.rest.pulls.get({
@@ -366,7 +344,7 @@ export class GitHub {
     };
   }
   async associated(t: Target, sha: string): Promise<number[]> {
-    const client = await this.client(t.installationId);
+    const client = this.client;
     return (
       await this.pages(
         client,
@@ -383,7 +361,7 @@ export class GitHub {
       .map((p) => p.number);
   }
   async config(t: Target, baseSha: string): Promise<string | null> {
-    const client = await this.client(t.installationId);
+    const client = this.client;
     try {
       const content = z.string().parse(
         (
@@ -456,7 +434,7 @@ export class GitHub {
     }
   }
   async permission(t: Target, username: string): Promise<string> {
-    const client = await this.client(t.installationId);
+    const client = this.client;
     const result = z
       .object({ permission: z.string(), role_name: z.string().optional() })
       .parse(
@@ -483,7 +461,7 @@ export class GitHub {
     t: Target,
     label: string,
   ): Promise<{ id: string; actor: string } | null> {
-    const client = await this.client(t.installationId);
+    const client = this.client;
     const events = await this.pages(
       client,
       client.rest.issues.listEventsForTimeline,
@@ -516,7 +494,7 @@ export class GitHub {
       : null;
   }
   async snapshot(t: Target, sha: string): Promise<Snapshot> {
-    const client = await this.client(t.installationId);
+    const client = this.client;
     const checks = (
       await this.pages(client, client.rest.checks.listForRef, {
         owner: t.owner,
@@ -682,7 +660,7 @@ export class GitHub {
     };
   }
   async findCheck(t: Target, sha: string): Promise<number | null> {
-    const client = await this.client(t.installationId);
+    const client = this.client;
     const externalId = `warden:${t.installationId}/${t.repositoryId}:${sha}`;
     const runs = (
       await this.pages(client, client.rest.checks.listForRef, {
@@ -698,7 +676,7 @@ export class GitHub {
     return runs.sort((a, b) => b.id - a.id)[0]?.id ?? null;
   }
   async findComment(t: Target): Promise<number | null> {
-    const client = await this.client(t.installationId);
+    const client = this.client;
     const comments = (
       await this.pages(client, client.rest.issues.listComments, {
         owner: t.owner,
@@ -716,7 +694,7 @@ export class GitHub {
     );
   }
   async commentExists(t: Target, id: number): Promise<boolean> {
-    const client = await this.client(t.installationId);
+    const client = this.client;
     try {
       const comment = commentSchema.parse(
         (
@@ -743,7 +721,7 @@ export class GitHub {
     decision: Decision,
     id: number | null,
   ): Promise<number> {
-    const client = await this.client(t.installationId);
+    const client = this.client;
     const summary = [decision.reason, ...decision.blockers.map((b) => `- ${b}`)]
       .join("\n")
       .slice(0, 60000);
@@ -786,7 +764,7 @@ export class GitHub {
     id: number | null,
     timing?: { last: string; next: string | null },
   ): Promise<number> {
-    const client = await this.client(t.installationId);
+    const client = this.client;
     const escapeText = (v: string) =>
       v.replace(/[@<>&`*_[\]\\]/g, (c) => `&#${c.charCodeAt(0)};`);
     const counts = { passed: 0, running: 0, failed: 0, ignored: 0 };

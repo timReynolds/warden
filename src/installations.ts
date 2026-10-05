@@ -155,7 +155,7 @@ export async function onboardInstallation(
   );
   if (state !== "active") return 0;
   const t = { installationId, repositoryId: 0, owner: "", repo: "", number: 0 };
-  const repos = await github.repositories(installationId);
+  const repos = await github.repositories();
   let count = 0;
   for (const repo of repos) {
     const r = z

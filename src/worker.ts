@@ -4,7 +4,7 @@ import type { Database } from "./db";
 import { claim, enqueue, fail, finish, heartbeat } from "./db/queue";
 import type { Env } from "./env";
 import { processDelivery, recoverFailedDelivery } from "./events";
-import { GitHub } from "./github";
+import { createApp, GitHub, type GitHubApp } from "./github";
 import { type Controls, reconcile } from "./reconcile";
 
 const target = z.object({
@@ -16,7 +16,8 @@ const target = z.object({
 });
 export async function workOnce(
   db: Database,
-  github: GitHub,
+  app: GitHubApp,
+  appId: number,
   leaseSeconds = 60,
   controls?: Controls,
 ): Promise<boolean> {
@@ -44,19 +45,21 @@ export async function workOnce(
   );
   try {
     let delay: number | null = null;
-    if (job.kind === "delivery") await processDelivery(db, github, job);
+    if (job.kind === "delivery") await processDelivery(db, app, appId, job);
     else {
       const currentTarget = target.parse(job.payload);
       const events = job.payload.wardenObservation === "events";
-      delay = await github.withClient(currentTarget.installationId, () =>
-        reconcile(
-          db,
-          github,
-          currentTarget,
-          controls,
-          job.payload.wardenRenew === true,
-          events,
-        ),
+      const github = new GitHub(
+        await app.getInstallationOctokit(currentTarget.installationId),
+        appId,
+      );
+      delay = await reconcile(
+        db,
+        github,
+        currentTarget,
+        controls,
+        job.payload.wardenRenew === true,
+        events,
       );
       // Event bursts coalesce independently of scheduled recovery. A fast
       // update must not postpone or consume the durable full-read job.
@@ -104,8 +107,8 @@ export async function workOnce(
   }
   return true;
 }
-export function createGitHub(db: Database, env: Env) {
-  return new GitHub(env, async (route, status) => {
+export function createGitHubApp(db: Database, env: Env) {
+  return createApp(env, async (route, status) => {
     await db.execute(
       sql`INSERT INTO warden_metrics(name,value) VALUES('github_requests',1) ON CONFLICT(name) DO UPDATE SET value=warden_metrics.value+1`,
     );
@@ -126,14 +129,21 @@ export function createGitHub(db: Database, env: Env) {
 
 export async function runWorker(
   db: Database,
-  github: GitHub,
+  app: GitHubApp,
   env: Env,
   signal: AbortSignal,
 ) {
   console.log("Warden worker started");
   while (!signal.aborted) {
     try {
-      if (!(await workOnce(db, github, env.WARDEN_JOB_LEASE_SECONDS)))
+      if (
+        !(await workOnce(
+          db,
+          app,
+          env.WARDEN_APP_ID,
+          env.WARDEN_JOB_LEASE_SECONDS,
+        ))
+      )
         await Bun.sleep(env.WARDEN_WORKER_POLL_MS);
     } catch (error) {
       console.error("Warden worker database error", String(error));
