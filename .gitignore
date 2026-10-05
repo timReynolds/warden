@@ -8,6 +8,7 @@ dist/
 *.p12
 *.pfx
 *.log
+*.dump
 .DS_Store
 coverage/
 .demo-results.json
