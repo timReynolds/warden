@@ -60,8 +60,7 @@ webhook processing and recovery after a worker restart in an isolated project.
 
 CI additionally checks dependency audit results, license notices, PostgreSQL
 upgrade safeguards, Docker builds, and the isolated demo. The upgrade test is
-`sh scripts/test-postgres-upgrade.sh`; see the
-[upgrade guide](docs/postgresql-upgrade.md) for what it verifies.
+`sh scripts/test-postgres-upgrade.sh`.
 
 For a suspected security vulnerability, use GitHub's private **Report a
 vulnerability** option in the repository's Security tab when available. If it is
