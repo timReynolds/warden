@@ -1,4 +1,4 @@
-FROM oven/bun:1.4.2 AS dependencies
+FROM oven/bun:1.4.3 AS dependencies
 WORKDIR /app
 COPY package.json bun.lock ./
 RUN bun install --frozen-lockfile
@@ -8,7 +8,7 @@ FROM dependencies AS build
 COPY src ./src
 COPY migrations ./migrations
 RUN bun run build
-FROM oven/bun:1.4.2 AS runtime
+FROM oven/bun:1.4.3 AS runtime
 WORKDIR /app
 LABEL org.opencontainers.image.title="Warden"
 LABEL org.opencontainers.image.description="Webhook-first GitHub App for aggregate PR checks"
